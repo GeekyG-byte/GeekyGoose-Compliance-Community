@@ -3,13 +3,13 @@ FROM python:3.15-rc-alpine3.22
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apk add --no-cache \
     gcc \
     g++ \
-    libpq-dev \
+    musl-dev \
+    postgresql-dev \
     tesseract-ocr \
-    poppler-utils \
-    && rm -rf /var/lib/apt/lists/*
+    poppler-utils
 
 # Copy requirements first for better caching
 COPY requirements.txt .
