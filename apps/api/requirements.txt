@@ -57,3 +57,4 @@ certifi>=2024.8.30 # Updated certificate bundle
 python-magic==0.4.27  # For better file type detection
 chardet==5.2.0  # Character encoding detection
 python-dateutil==2.9.0.post0  # Date parsing utilities
+numpy>=1.22.2 # not directly required, pinned by Snyk to avoid a vulnerability
