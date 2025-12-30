@@ -17,7 +17,81 @@ interface Control {
   title: string;
   description: string;
   requirements_count: number;
+  linked_documents_count: number;
   created_at: string;
+}
+
+interface LinkedDocument {
+  id: string;
+  filename: string;
+  mime_type: string;
+  file_size: number;
+  created_at: string;
+  download_url: string;
+  confidence: number;
+  reasoning: string;
+  link_created_at: string;
+}
+
+function LinkedDocuments({ controlId }: { controlId: string }) {
+  const [documents, setDocuments] = useState<LinkedDocument[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const fetchDocuments = async () => {
+      try {
+        const response = await fetch(`/api/controls/${controlId}/documents`);
+        if (response.ok) {
+          const data = await response.json();
+          setDocuments(data.documents);
+        }
+      } catch (error) {
+        console.error('Failed to fetch linked documents:', error);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchDocuments();
+  }, [controlId]);
+
+  if (loading) {
+    return <div className="text-xs text-gray-500">Loading...</div>;
+  }
+
+  if (documents.length === 0) {
+    return <div className="text-xs text-gray-500">No documents linked</div>;
+  }
+
+  return (
+    <div className="space-y-1">
+      {documents.slice(0, 2).map((doc) => (
+        <div key={doc.id} className="flex items-center justify-between text-xs">
+          <div className="flex items-center space-x-1 flex-1 min-w-0">
+            <span className="text-green-700 truncate" title={doc.filename}>
+              📄 {doc.filename.split('/').pop()}
+            </span>
+            <div className={`w-1.5 h-1.5 rounded-full ${
+              doc.confidence >= 0.8 ? 'bg-green-500' :
+              doc.confidence >= 0.6 ? 'bg-yellow-500' : 'bg-orange-500'
+            }`} title={`Confidence: ${Math.round(doc.confidence * 100)}%`}></div>
+          </div>
+          <a
+            href={doc.download_url}
+            className="text-green-600 hover:text-green-800 ml-1"
+            title="Download"
+          >
+            ⬇
+          </a>
+        </div>
+      ))}
+      {documents.length > 2 && (
+        <div className="text-xs text-green-600">
+          +{documents.length - 2} more document{documents.length - 2 !== 1 ? 's' : ''}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export default function ControlsPage() {
@@ -117,14 +191,36 @@ export default function ControlsPage() {
                         {control.title}
                       </h4>
                     </div>
-                    <span className="bg-gray-100 text-gray-800 text-xs px-2 py-1 rounded-full">
-                      {control.requirements_count} reqs
-                    </span>
+                    <div className="flex flex-col space-y-1">
+                      <span className="bg-gray-100 text-gray-800 text-xs px-2 py-1 rounded-full text-center">
+                        {control.requirements_count} reqs
+                      </span>
+                      <span className={`text-xs px-2 py-1 rounded-full text-center ${
+                        control.linked_documents_count > 0 
+                          ? 'bg-green-100 text-green-800' 
+                          : 'bg-orange-100 text-orange-800'
+                      }`}>
+                        {control.linked_documents_count > 0 
+                          ? `🧠 ${control.linked_documents_count} doc${control.linked_documents_count !== 1 ? 's' : ''}`
+                          : '📄 No docs'
+                        }
+                      </span>
+                    </div>
                   </div>
                   
                   <p className="text-gray-600 text-sm mb-4 line-clamp-3">
                     {control.description}
                   </p>
+                  
+                  {/* Show linked documents if any */}
+                  {control.linked_documents_count > 0 && (
+                    <div className="mb-4 p-2 bg-green-50 rounded border">
+                      <div className="text-xs font-medium text-green-800 mb-1">
+                        🤖 AI-Linked Evidence:
+                      </div>
+                      <LinkedDocuments controlId={control.id} />
+                    </div>
+                  )}
                   
                   <div className="flex justify-between items-center">
                     <Link

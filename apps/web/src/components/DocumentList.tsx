@@ -7,8 +7,17 @@ interface Document {
   filename: string
   mime_type: string
   file_size: number
+  sha256: string
   created_at: string
   download_url: string
+  ai_processed: boolean
+  control_links: Array<{
+    control_id: string
+    control_code: string
+    control_title: string
+    confidence: number
+    reasoning: string
+  }>
 }
 
 interface ControlMapping {
@@ -149,17 +158,17 @@ export default function DocumentList({ refreshTrigger }: { refreshTrigger?: numb
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 w-full overflow-hidden">
       <h2 className="text-xl font-semibold text-gray-900">Uploaded Documents</h2>
       
       <div className="grid gap-4">
         {documents.map((doc) => (
-          <div key={doc.id} className="bg-white border border-gray-200 rounded-lg p-4 hover:shadow-md transition-shadow">
-            <div className="flex items-start justify-between">
-              <div className="flex items-start space-x-3 flex-1">
-                <div className="text-2xl">{getFileIcon(doc.mime_type)}</div>
+          <div key={doc.id} className="bg-white border border-gray-200 rounded-lg p-4 hover:shadow-md transition-shadow w-full overflow-hidden">
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex items-start space-x-3 flex-1 min-w-0">
+                <div className="text-2xl flex-shrink-0">{getFileIcon(doc.mime_type)}</div>
                 
-                <div className="flex-1 min-w-0">
+                <div className="flex-1 min-w-0 overflow-hidden">
                   <h3 className="text-sm font-medium text-gray-900 truncate">
                     {doc.filename}
                   </h3>
@@ -168,28 +177,69 @@ export default function DocumentList({ refreshTrigger }: { refreshTrigger?: numb
                     <p>Uploaded: {formatDate(doc.created_at)}</p>
                     <p>Type: {doc.mime_type}</p>
                     
-                    {/* Control Mappings */}
+                    {/* AI Processing Status */}
+                    <div className="flex items-center space-x-2 mt-2">
+                      {doc.ai_processed ? (
+                        <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                          🧠 AI Analyzed
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-orange-100 text-orange-800">
+                          ⏳ Processing
+                        </span>
+                      )}
+                    </div>
+                    
+                    {/* Control Links from AI */}
+                    {doc.control_links.length > 0 && (
+                      <div className="mt-2 pt-2 border-t border-gray-200">
+                        <p className="text-xs font-medium text-gray-700 mb-1">🤖 AI-Linked Controls:</p>
+                        <div className="space-y-1 max-w-full">
+                          {doc.control_links.map((link, idx) => (
+                            <div key={idx} className="flex items-center justify-between bg-green-50 rounded px-2 py-1 min-w-0">
+                              <div className="flex items-center space-x-2 flex-1 min-w-0">
+                                <span className="text-xs font-medium text-green-800 flex-shrink-0">
+                                  {link.control_code}
+                                </span>
+                                <span className="text-xs text-green-600 truncate flex-1 min-w-0" title={link.control_title}>
+                                  {link.control_title}
+                                </span>
+                                <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                                  link.confidence >= 0.8 ? 'bg-green-500' :
+                                  link.confidence >= 0.6 ? 'bg-yellow-500' : 'bg-orange-500'
+                                }`} title={`Confidence: ${Math.round(link.confidence * 100)}%`}></div>
+                              </div>
+                              <span className="text-xs text-green-700 flex-shrink-0 ml-2">
+                                {Math.round(link.confidence * 100)}%
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    
+                    {/* Manual Control Mappings (legacy) */}
                     {getDocumentMappings(doc.id).length > 0 && (
                       <div className="mt-2 pt-2 border-t border-gray-200">
-                        <p className="text-xs font-medium text-gray-700 mb-1">🔗 Mapped to Controls:</p>
-                        <div className="space-y-1">
+                        <p className="text-xs font-medium text-gray-700 mb-1">📎 Manual Links:</p>
+                        <div className="space-y-1 max-w-full">
                           {getDocumentMappings(doc.id).map((mapping, idx) => (
-                            <div key={idx} className="flex items-center justify-between bg-blue-50 rounded px-2 py-1">
-                              <div className="flex items-center space-x-2">
-                                <span className="text-xs font-medium text-blue-800">
+                            <div key={idx} className="flex items-center justify-between bg-blue-50 rounded px-2 py-1 min-w-0">
+                              <div className="flex items-center space-x-2 flex-1 min-w-0">
+                                <span className="text-xs font-medium text-blue-800 flex-shrink-0">
                                   {mapping.control_code}
                                 </span>
-                                <span className="text-xs text-blue-600">
+                                <span className="text-xs text-blue-600 truncate flex-1 min-w-0" title={mapping.framework_name}>
                                   {mapping.framework_name}
                                 </span>
-                                <div className={`w-1.5 h-1.5 rounded-full ${
+                                <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
                                   mapping.confidence >= 0.8 ? 'bg-green-500' :
                                   mapping.confidence >= 0.6 ? 'bg-yellow-500' : 'bg-orange-500'
                                 }`}></div>
                               </div>
                               <button
                                 onClick={() => removeMapping(doc.id, mapping.control_code)}
-                                className="text-xs text-red-600 hover:text-red-700"
+                                className="text-xs text-red-600 hover:text-red-700 flex-shrink-0 ml-2"
                                 title="Remove mapping"
                               >
                                 ×
@@ -203,20 +253,20 @@ export default function DocumentList({ refreshTrigger }: { refreshTrigger?: numb
                 </div>
               </div>
               
-              <div className="flex flex-col space-y-2 ml-4">
-                <div className="flex space-x-2">
+              <div className="flex flex-col space-y-2 flex-shrink-0">
+                <div className="flex flex-col sm:flex-row space-y-1 sm:space-y-0 sm:space-x-2">
                   <a
                     href={doc.download_url}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="inline-flex items-center px-3 py-1 border border-gray-300 text-sm font-medium rounded text-gray-700 bg-white hover:bg-gray-50"
+                    className="inline-flex items-center justify-center px-3 py-1 border border-gray-300 text-sm font-medium rounded text-gray-700 bg-white hover:bg-gray-50 whitespace-nowrap"
                   >
                     Download
                   </a>
                   
                   <button
                     onClick={() => deleteDocument(doc.id)}
-                    className="inline-flex items-center px-3 py-1 border border-red-300 text-sm font-medium rounded text-red-700 bg-white hover:bg-red-50"
+                    className="inline-flex items-center justify-center px-3 py-1 border border-red-300 text-sm font-medium rounded text-red-700 bg-white hover:bg-red-50 whitespace-nowrap"
                   >
                     Delete
                   </button>
@@ -224,7 +274,7 @@ export default function DocumentList({ refreshTrigger }: { refreshTrigger?: numb
                 
                 {/* Control Mapping Summary */}
                 {getDocumentMappings(doc.id).length > 0 && (
-                  <div className="text-xs text-gray-500">
+                  <div className="text-xs text-gray-500 text-center sm:text-left">
                     🔗 {getDocumentMappings(doc.id).length} control{getDocumentMappings(doc.id).length > 1 ? 's' : ''} mapped
                   </div>
                 )}

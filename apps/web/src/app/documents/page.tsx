@@ -41,15 +41,18 @@ export default function DocumentsPage() {
                 <li>• PDF Documents (.pdf)</li>
                 <li>• Word Documents (.docx)</li>
                 <li>• Text Files (.txt)</li>
-                <li>• Images (.png, .jpg, .jpeg)</li>
+                <li>• Images (.png, .jpg, .gif, .bmp, .tiff, .webp)</li>
               </ul>
-              <p className="text-xs text-blue-700 mt-2">Maximum file size: 50MB</p>
+              <p className="text-xs text-blue-700 mt-2">Maximum file size: 50MB per file</p>
+              <p className="text-xs text-blue-600 mt-1">✨ Select multiple files for batch upload</p>
+              <p className="text-xs text-green-700 mt-1 font-medium">📸 Images use OCR to extract text automatically</p>
             </div>
 
             <div className="bg-green-50 p-4 rounded-lg">
               <h3 className="font-medium text-green-900 mb-2">🤖 Smart Control Mapping</h3>
               <p className="text-sm text-green-800 mb-3">
-                Our AI automatically scans uploaded documents and suggests relevant compliance controls based on content analysis.
+                Our AI automatically scans uploaded documents and suggests relevant compliance controls. 
+                <strong> NEW: Upload multiple files at once</strong> for batch processing and comprehensive AI analysis across all documents.
               </p>
               <div className="flex space-x-2">
                 <Link
@@ -76,8 +79,8 @@ export default function DocumentsPage() {
             </div>
           </div>
 
-          <div>
-            <div className="bg-white p-6 rounded-lg border border-gray-200">
+          <div className="min-w-0">
+            <div className="bg-white p-6 rounded-lg border border-gray-200 w-full overflow-hidden">
               <DocumentList refreshTrigger={refreshTrigger} />
             </div>
           </div>

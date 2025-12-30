@@ -4,13 +4,16 @@ import json
 import json as json_module
 import requests
 import logging
+import asyncio
+from datetime import datetime, timedelta
 from typing import List, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from database import get_db
-from models import Document, Org, User, Framework, Control, Requirement, EvidenceLink, Scan, ScanResult, Gap
+from models import Document, Org, User, Framework, Control, Requirement, EvidenceLink, Scan, ScanResult, Gap, DocumentControlLink, DocumentPage
 from storage import storage
 from worker_tasks import extract_document_text, process_scan
 from pydantic import BaseModel
@@ -19,6 +22,369 @@ from init_db import initialize_database
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def _analyze_document_two_step(file_text: str, filename: str, available_controls: List[dict], ai_client) -> List[dict]:
+    """
+    Two-step document analysis:
+    1. First scan and summarize the document
+    2. Then map the summary to compliance controls
+    """
+    if isinstance(ai_client, dict) and ai_client.get('type') == 'ollama':
+        return _analyze_document_ollama_two_step(file_text, filename, available_controls, ai_client)
+    else:
+        return _analyze_document_openai_two_step(file_text, filename, available_controls, ai_client)
+
+def _analyze_document_ollama_two_step(file_text: str, filename: str, available_controls: List[dict], ai_client: dict) -> List[dict]:
+    """JSON-to-JSON two-step analysis specifically for Ollama models"""
+    import requests
+    import json as json_module
+    
+    endpoint = ai_client['endpoint']
+    model = ai_client['model']
+    
+    # Step 1: Document Scanning - Create JSON Summary
+    scan_prompt = f"""Analyze document: {filename}
+Content: {file_text[:1000]}
+
+Return JSON summary:
+{{"document_type":"screenshot","primary_topic":"main subject","key_content_indicators":["keywords found"],"security_areas":["security domain"],"main_requirements":["core requirement"],"distinguishing_features":"what makes this unique"}}"""
+    
+    logger.info(f"Step 1: Creating JSON summary for {filename}")
+    
+    try:
+        # Use only generate API for completions
+        scan_response = requests.post(
+            f"{endpoint}/api/generate",
+            json={
+                "model": model,
+                "prompt": scan_prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,
+                    "num_predict": 400,  # Much longer for complete JSON
+                    "num_ctx": int(os.getenv("OLLAMA_CONTEXT_SIZE", "32768")),
+                    "stop": ["\n\n\n"]  # Only stop on triple newlines
+                }
+            },
+            timeout=90
+        )
+        
+        if scan_response.status_code != 200:
+            logger.error(f"Step 1 failed for {filename}: {scan_response.status_code}")
+            return generate_fallback_suggestions_from_filename(filename, available_controls)
+        
+        scan_result = scan_response.json()
+        
+        # Use only generate API response format
+        document_summary_raw = scan_result.get('response', '')
+        logger.info(f"Step 1: Using generate API response for {filename}")
+        
+        # NEVER use thinking field - log but ignore
+        if 'thinking' in scan_result and scan_result.get('thinking'):
+            logger.info(f"Step 1: Thinking field ignored for {filename}: {scan_result.get('thinking', '')[:100]}...")
+        
+        if not document_summary_raw:
+            logger.warning(f"Step 1 produced empty summary for {filename}")
+            return generate_fallback_suggestions_from_filename(filename, available_controls)
+        
+        logger.info(f"Step 1 raw response for {filename}: {document_summary_raw[:300]}...")
+        
+        # Parse the JSON summary from Step 1
+        document_summary_json = _extract_json_from_response(document_summary_raw)
+        if not document_summary_json:
+            logger.warning(f"Step 1 failed to produce valid JSON for {filename}")
+            return generate_fallback_suggestions_from_filename(filename, available_controls)
+        
+        logger.info(f"Step 1 JSON summary for {filename}: {document_summary_json}")
+        
+        # Step 2: Control Mapping using the JSON from Step 1
+        controls_json = []
+        for i, control in enumerate(available_controls[:20], 1):
+            controls_json.append({
+                "number": i,
+                "code": control['code'],
+                "title": control['title'],
+                "framework": control.get('framework', 'Unknown')
+            })
+        
+        mapping_prompt = f"""Document Summary: {json_module.dumps(document_summary_json, indent=2)}
+
+Available Controls: {json_module.dumps(controls_json, indent=2)}
+
+Return control mapping JSON:
+{{"selected_control_number":1,"confidence":0.90,"reasoning":"Brief match explanation"}}"""
+        
+        logger.info(f"Step 2: JSON mapping controls for {filename}")
+        
+        # Use only generate API for completions
+        mapping_response = requests.post(
+            f"{endpoint}/api/generate",
+            json={
+                "model": model,
+                "prompt": mapping_prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,
+                    "num_predict": 300,  # Much longer for complete JSON
+                    "num_ctx": int(os.getenv("OLLAMA_CONTEXT_SIZE", "32768")),
+                    "stop": ["\n\n\n"]  # Only stop on triple newlines
+                }
+            },
+            timeout=90
+        )
+        
+        if mapping_response.status_code != 200:
+            logger.error(f"Step 2 failed for {filename}: {mapping_response.status_code}")
+            return generate_fallback_suggestions_from_filename(filename, available_controls)
+        
+        mapping_result = mapping_response.json()
+        
+        # Use only generate API response format
+        mapping_text_raw = mapping_result.get('response', '')
+        logger.info(f"Step 2: Using generate API response for {filename}")
+        
+        # NEVER use thinking field - log but ignore
+        if 'thinking' in mapping_result and mapping_result.get('thinking'):
+            logger.info(f"Step 2: Thinking field ignored for {filename}: {mapping_result.get('thinking', '')[:100]}...")
+        
+        if not mapping_text_raw:
+            logger.warning(f"Step 2 produced empty mapping for {filename}")
+            return generate_fallback_suggestions_from_filename(filename, available_controls)
+        
+        logger.info(f"Step 2 raw response for {filename}: {mapping_text_raw}")
+        
+        # Parse the JSON mapping result from Step 2
+        mapping_json = _extract_json_from_response(mapping_text_raw)
+        if not mapping_json:
+            logger.warning(f"Step 2 failed to produce valid JSON for {filename}")
+            return generate_fallback_suggestions_from_filename(filename, available_controls)
+        
+        logger.info(f"Step 2 JSON mapping for {filename}: {mapping_json}")
+        
+        # Convert the JSON result to the expected format
+        return _convert_json_mapping_to_suggestions(mapping_json, available_controls, controls_json)
+        
+    except Exception as e:
+        logger.error(f"JSON-to-JSON two-step analysis failed for {filename}: {e}")
+        return generate_fallback_suggestions_from_filename(filename, available_controls)
+
+def _convert_json_mapping_to_suggestions(mapping_json: dict, available_controls: List[dict], controls_json: List[dict]) -> List[dict]:
+    """Convert JSON mapping result to the expected suggestions format"""
+    try:
+        selected_number = mapping_json.get('selected_control_number', 1)
+        confidence = mapping_json.get('confidence', 0.5)
+        reasoning = mapping_json.get('reasoning', 'AI analysis')
+        
+        # Validate the selected control number
+        if 1 <= selected_number <= len(controls_json):
+            control_index = selected_number - 1  # Convert to 0-indexed
+            if control_index < len(available_controls):
+                control = available_controls[control_index]
+                return [{
+                    'control_code': control['code'],
+                    'control_title': control['title'],
+                    'framework_name': control.get('framework', 'Unknown'),
+                    'confidence': max(0.0, min(1.0, float(confidence))),
+                    'reasoning': reasoning[:200]  # Limit length
+                }]
+        
+        logger.warning(f"Invalid control number {selected_number} in JSON mapping")
+        return []
+        
+    except Exception as e:
+        logger.error(f"Failed to convert JSON mapping: {e}")
+        return []
+
+def _parse_structured_control_response(response_text: str, available_controls: List[dict]) -> List[dict]:
+    """Parse the structured NUMBER/REASONING response format"""
+    import re
+    
+    try:
+        # Extract number and reasoning
+        number_match = re.search(r'NUMBER:\s*(\d+)', response_text, re.IGNORECASE)
+        reasoning_match = re.search(r'REASONING:\s*(.+)', response_text, re.IGNORECASE | re.DOTALL)
+        
+        if not number_match:
+            logger.warning("Could not find NUMBER in structured response")
+            return []
+        
+        control_number = int(number_match.group(1)) - 1  # Convert to 0-indexed
+        reasoning = reasoning_match.group(1).strip() if reasoning_match else "AI analysis"
+        
+        # Validate control number
+        if 0 <= control_number < len(available_controls):
+            control = available_controls[control_number]
+            return [{
+                'control_code': control['code'],
+                'control_title': control['title'],
+                'framework_name': control.get('framework', 'Unknown'),
+                'confidence': 0.85,  # High confidence for structured response
+                'reasoning': reasoning[:200]  # Limit length
+            }]
+        else:
+            logger.warning(f"Invalid control number: {control_number + 1}")
+            return []
+            
+    except Exception as e:
+        logger.error(f"Failed to parse structured response: {e}")
+        return []
+
+def _analyze_document_openai_two_step(file_text: str, filename: str, available_controls: List[dict], ai_client) -> List[dict]:
+    """Two-step analysis for OpenAI (can use structured outputs natively)"""
+    # For now, use existing OpenAI logic but could be enhanced with structured outputs
+    return []
+
+def generate_fallback_suggestions_from_filename(filename: str, available_controls: List[dict]) -> List[dict]:
+    """Generate control suggestions based on filename when AI analysis fails."""
+    filename_lower = filename.lower()
+    
+    # Common patterns for compliance documents
+    suggestions = []
+    
+    for control in available_controls[:10]:  # Check first 10 controls
+        confidence = 0.3  # Default low confidence for filename matching
+        reasoning = f"Filename-based suggestion for {filename}"
+        
+        # Patch management documents
+        if any(word in filename_lower for word in ['patch', 'update', 'os']):
+            if any(word in control['code'].lower() or word in control['title'].lower() 
+                   for word in ['patch', 'update', 'os', 'operating']):
+                confidence = 0.7
+                reasoning = f"Document name suggests patch management, matching {control['code']}"
+        
+        # Access control documents
+        elif any(word in filename_lower for word in ['access', 'auth', 'mfa', 'login']):
+            if any(word in control['code'].lower() or word in control['title'].lower() 
+                   for word in ['access', 'auth', 'mfa', 'authentication']):
+                confidence = 0.7
+                reasoning = f"Document name suggests access control, matching {control['code']}"
+        
+        # Backup documents
+        elif any(word in filename_lower for word in ['backup', 'recovery']):
+            if any(word in control['code'].lower() or word in control['title'].lower() 
+                   for word in ['backup', 'recovery']):
+                confidence = 0.7
+                reasoning = f"Document name suggests backup/recovery, matching {control['code']}"
+        
+        # Application control documents
+        elif any(word in filename_lower for word in ['app', 'software', 'application']):
+            if any(word in control['code'].lower() or word in control['title'].lower() 
+                   for word in ['application', 'software']):
+                confidence = 0.6
+                reasoning = f"Document name suggests application control, matching {control['code']}"
+        
+        if confidence > 0.5:
+            suggestions.append({
+                'control_code': control['code'],
+                'control_title': control['title'],
+                'framework_name': control.get('framework', 'Unknown'),
+                'confidence': confidence,
+                'reasoning': reasoning
+            })
+    
+    # Return top 3 suggestions
+    return sorted(suggestions, key=lambda x: x['confidence'], reverse=True)[:3]
+
+def _extract_json_content_only(response_text):
+    """Extract just the JSON object as a string, no parsing."""
+    if not response_text:
+        return None
+    
+    import re
+    
+    # Find the first JSON object in the response
+    json_pattern = r'\{[^{}]*"suggestions"[^{}]*\[[^\]]*\][^{}]*\}'
+    match = re.search(json_pattern, response_text, re.DOTALL)
+    if match:
+        return match.group(0).strip()
+    
+    # Fallback: look for any JSON-like structure
+    json_pattern = r'\{[\s\S]*?\}'
+    match = re.search(json_pattern, response_text, re.DOTALL)
+    if match:
+        return match.group(0).strip()
+    
+    return None
+
+def _extract_json_from_response(response_text):
+    """Extract JSON from a response that might contain extra text."""
+    if not response_text:
+        logger.warning("Empty response text for JSON extraction")
+        return None
+    
+    # Try to find JSON object in the response
+    import re
+    import json
+    
+    # Clean the response text
+    response_text = response_text.strip()
+    logger.info(f"Extracting JSON from response (length: {len(response_text)}): {response_text[:200]}...")
+    
+    # First, try to parse the entire response as JSON
+    try:
+        parsed = json.loads(response_text)
+        if isinstance(parsed, dict):
+            logger.info("Successfully parsed entire response as JSON")
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    
+    # Look for JSON object patterns (more comprehensive)
+    json_patterns = [
+        r'\{[^{}]*"document_type"[^{}]*\}',  # Document summary JSON
+        r'\{[^{}]*"selected_control_number"[^{}]*\}',  # Control mapping JSON
+        r'\{[^{}]*"suggestions"[^{}]*\[[^\]]*\][^{}]*\}',  # Suggestions JSON
+        r'\{.*?"suggestions".*?\[.*?\].*?\}',  # More flexible suggestions pattern
+        r'\{[\s\S]*?\}',  # Any JSON object (non-greedy)
+    ]
+    
+    for i, pattern in enumerate(json_patterns):
+        matches = re.findall(pattern, response_text, re.DOTALL)
+        for match in matches:
+            try:
+                # Clean the match
+                cleaned_match = match.strip()
+                parsed = json.loads(cleaned_match)
+                if isinstance(parsed, dict):
+                    logger.info(f"Successfully extracted JSON using pattern {i}: {cleaned_match[:100]}...")
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+    
+    # Try to find JSON between code block markers
+    code_block_patterns = [
+        r'```json\s*(\{.*?\})\s*```',
+        r'```\s*(\{.*?\})\s*```',
+    ]
+    
+    for pattern in code_block_patterns:
+        matches = re.findall(pattern, response_text, re.DOTALL)
+        for match in matches:
+            try:
+                parsed = json.loads(match.strip())
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+    
+    # Try the whole response as-is
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        pass
+    
+    # Last resort: try to extract just the JSON portion
+    try:
+        # Find first { and last }
+        start = response_text.find('{')
+        end = response_text.rfind('}')
+        if start >= 0 and end > start:
+            json_portion = response_text[start:end+1]
+            return json.loads(json_portion)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    
+    return None
 
 def _safe_json_loads(json_data, default=None):
     """Safely parse JSON data, returning default value if parsing fails."""
@@ -53,10 +419,19 @@ async def lifespan(app: FastAPI):
         logger.error("Database initialization failed!")
         raise RuntimeError("Database initialization failed")
     
+    # Start the periodic AI retry task
+    retry_task = asyncio.create_task(periodic_ai_retry_task())
+    logger.info("Started periodic AI retry task")
+    
     logger.info("GeekyGoose Compliance API startup complete")
     yield
     # Shutdown
     logger.info("GeekyGoose Compliance API shutting down...")
+    retry_task.cancel()
+    try:
+        await retry_task
+    except asyncio.CancelledError:
+        logger.info("Periodic AI retry task cancelled")
 
 app = FastAPI(
     title="GeekyGoose Compliance API",
@@ -131,10 +506,12 @@ async def analyze_file_content_for_controls(file: UploadFile, file_content: byte
         try:
             import magic
             file_mime = magic.from_buffer(file_content, mime=True)
-        except:
-            file_mime = file.content_type
+        except (ImportError, Exception) as e:
+            logger.debug(f"Magic library not available or failed ({e}), using file content_type")
+            file_mime = getattr(file, 'content_type', 'text/plain')
         
-        if file_mime == "text/plain" or file.content_type == "text/plain" or filename.lower().endswith(('.txt', '.md', '.csv')):
+        file_content_type = getattr(file, 'content_type', 'text/plain')
+        if file_mime == "text/plain" or file_content_type == "text/plain" or filename.lower().endswith(('.txt', '.md', '.csv')):
             try:
                 import chardet
                 # Detect encoding for better text extraction
@@ -327,8 +704,8 @@ async def analyze_file_content_for_controls(file: UploadFile, file_content: byte
         
         # Create analysis prompt
         controls_context = "\n".join([
-            f"- {c['code']}: {c['title']} ({c['framework']}) - {c['description'][:100]}..."
-            for c in available_controls[:10]  # Limit to avoid token limits
+            f"- {c['code']}: {c['title']} ({c['framework']}) - {c['description'][:500]}..."
+            for c in available_controls[:50]  # Increased from 10 to 50 controls, longer descriptions
         ])
         
         analysis_prompt = f"""
@@ -363,13 +740,29 @@ Respond ONLY with valid JSON in this exact format:
 
 Do not include any text before or after the JSON. Return empty suggestions array if no relevant controls found."""
         
-        # Call AI for analysis
+        # Call AI for analysis using new two-step approach
         try:
             from ai_scanner import get_ai_client
             logger.info(f"Attempting to get AI client for {filename}")
             ai_client = get_ai_client()
             logger.info(f"AI client initialized: {type(ai_client)}")
             
+            # Use the new two-step analysis approach
+            logger.info(f"Starting two-step analysis for {filename}")
+            suggested_controls = _analyze_document_two_step(
+                file_text=file_text,
+                filename=filename,
+                available_controls=available_controls,
+                ai_client=ai_client
+            )
+            
+            if suggested_controls:
+                logger.info(f"Two-step analysis succeeded for {filename}, got {len(suggested_controls)} suggestions")
+                return suggested_controls
+            else:
+                logger.warning(f"Two-step analysis failed for {filename}, falling back to original method")
+            
+            # Fallback to original method if two-step fails
             if isinstance(ai_client, dict) and ai_client.get('type') == 'ollama':
                 import requests
                 endpoint = ai_client['endpoint']
@@ -387,17 +780,18 @@ Do not include any text before or after the JSON. Return empty suggestions array
                     logger.error(f"Cannot connect to Ollama at {endpoint}: {conn_error}")
                     return generate_fallback_suggestions_from_filename(filename, available_controls)
                 
-                # Simpler prompt for better results
-                simple_prompt = f"""Analyze the document '{filename}' and suggest 1 compliance control.
-
-Document content: {file_text[:300] if file_text else 'Filename analysis'}
+                # Clear and simple prompt
+                simple_prompt = f"""Analyze document: {filename}
+Content: {file_text[:500] if file_text else 'Filename analysis only'}
 
 Available controls: {[c['code'] for c in available_controls[:3]]}
 
-Respond with JSON: {{"suggestions": [{{"control_code": "CODE", "control_title": "Title", "framework_name": "Framework", "confidence": 0.7, "reasoning": "why"}}]}}"""
+Respond with JSON only:
+{{"suggestions":[{{"control_code":"{available_controls[0]['code'] if available_controls else 'EE-1'}","control_title":"Title","framework_name":"Essential Eight","confidence":0.8,"reasoning":"Why this matches"}}]}}"""
                 
                 logger.info(f"Sending prompt to Ollama (length: {len(simple_prompt)})")
                 
+                # Use only generate API for completions
                 response = requests.post(
                     f"{endpoint}/api/generate",
                     json={
@@ -405,9 +799,12 @@ Respond with JSON: {{"suggestions": [{{"control_code": "CODE", "control_title": 
                         "prompt": simple_prompt,
                         "stream": False,
                         "options": {
-                            "temperature": 0.3,
-                            "num_predict": 300,
-                            "stop": ["\n\n", "```"]
+                            "temperature": 0.1,  # Slightly higher for more flexibility
+                            "num_predict": 500,  # Much longer to allow complete JSON
+                            "num_ctx": int(os.getenv("OLLAMA_CONTEXT_SIZE", "32768")),
+                            "stop": ["\n\n\n"],  # Only stop on triple newlines to allow full JSON
+                            "top_p": 0.9,
+                            "repeat_penalty": 1.0,
                         }
                     },
                     timeout=60
@@ -417,14 +814,53 @@ Respond with JSON: {{"suggestions": [{{"control_code": "CODE", "control_title": 
                 
                 if response.status_code == 200:
                     result = response.json()
+                    
+                    # Use only generate API response format
                     ai_response = result.get('response', '').strip()
-                    logger.info(f"Ollama raw response: '{ai_response[:200]}...'")
+                    logger.info(f"Using generate API response for {filename}")
+                    
+                    # Handle thinking field when content is empty - extract JSON if present
+                    if not ai_response and 'thinking' in result and result.get('thinking'):
+                        thinking_content = result.get('thinking', '')
+                        logger.info(f"Content empty, checking thinking field for JSON: '{thinking_content[:200]}...'")
+                        
+                        # Try to extract JSON from thinking field
+                        extracted_json = _extract_json_content_only(thinking_content)
+                        if extracted_json:
+                            logger.info(f"Found valid JSON in thinking field, using it: {extracted_json}")
+                            ai_response = extracted_json
+                        else:
+                            logger.warning(f"No valid JSON found in thinking field for {filename}")
+                    elif 'thinking' in result and result.get('thinking'):
+                        logger.info(f"Ollama thinking field (ignored): '{result.get('thinking', '')[:100]}...'")
+                    
+                    logger.info(f"Raw AI response for {filename}: \"{ai_response[:200]}...\"")
                     logger.info(f"Response length: {len(ai_response)}")
                     
+                    # Force clean JSON extraction if the response contains explanatory text
+                    if ai_response and ("We need" in ai_response or "Looking at" in ai_response or "The document" in ai_response):
+                        logger.warning(f"Response contains explanatory text, attempting JSON extraction")
+                        extracted_json = _extract_json_content_only(ai_response)
+                        if extracted_json:
+                            logger.info(f"Extracted JSON: {extracted_json}")
+                            ai_response = extracted_json
+                        else:
+                            logger.error(f"No valid JSON found in explanatory response")
+                            return generate_fallback_suggestions_from_filename(filename, available_controls)
+                    
                     if not ai_response:
-                        logger.warning(f"Ollama returned empty response for {filename}")
+                        logger.warning(f"AI scanning failed for {filename} - no valid response generated")
                         logger.info(f"Ollama result object: {result}")
-                        return generate_fallback_suggestions_from_filename(filename, available_controls)
+                        return []  # Simple empty result instead of filename fallback
+                    
+                    # Force JSON format validation
+                    if not ai_response.strip().startswith('{') or not ai_response.strip().endswith('}'):
+                        logger.warning(f"Response doesn't look like JSON for {filename}: {ai_response[:100]}")
+                        # Try to extract any JSON from the response
+                        ai_response = _extract_json_content_only(ai_response)
+                        if not ai_response:
+                            logger.error(f"No valid JSON found in response for {filename}")
+                            return generate_fallback_suggestions_from_filename(filename, available_controls)
                 else:
                     logger.error(f"Ollama error: {response.status_code} - {response.text[:200]}")
                     return generate_fallback_suggestions_from_filename(filename, available_controls)
@@ -478,7 +914,13 @@ Respond with JSON: {{"suggestions": [{{"control_code": "CODE", "control_title": 
                         if available_controls:
                             logger.info(f"Sample control: {available_controls[0]}")
                         # Try with a much simpler approach
-                        simple_prompt = f"Analyze the document '{filename}' and suggest 1 relevant compliance control from this list: {[c['code'] for c in available_controls[:5]]}. Respond with JSON: {{\"suggestions\": [{{\"control_code\": \"X\", \"control_title\": \"Y\", \"framework_name\": \"Z\", \"confidence\": 0.7, \"reasoning\": \"why\"}}]}}"
+                        simple_prompt = f"""You are a JSON API. Analyze '{filename}' and respond ONLY with valid JSON.
+
+Document content: {file_text[:200] if file_text else 'File analysis'}
+Available controls: {[c['code'] for c in available_controls[:5]]}
+
+Respond with ONLY this JSON structure:
+{{\"suggestions\": [{{\"control_code\": \"EXACT_CODE\", \"control_title\": \"Full title\", \"framework_name\": \"Framework\", \"confidence\": 0.7, \"reasoning\": \"brief explanation\"}}]}}"""
                         try:
                             simple_response = create_chat_completion_safe(
                                 client=ai_client,
@@ -630,9 +1072,180 @@ async def safe_analyze_file_content_for_controls(file, file_content):
         if not isinstance(result, list):
             logger.warning(f"analyze_file_content_for_controls returned non-list: {type(result)}")
             return []
+        
+        # Enforce one-control-per-document policy
+        if len(result) > 1:
+            logger.info(f"Multiple controls suggested for {file.filename}, returning only the highest confidence match")
+            # Sort by confidence and return only the highest one
+            result_sorted = sorted(result, key=lambda x: x.get('confidence', 0), reverse=True)
+            return [result_sorted[0]]
+        
         return result
     except Exception as e:
         logger.error(f"Safe analysis wrapper caught error for {file.filename}: {e}")
+        return []
+
+def find_unprocessed_documents() -> List[Document]:
+    """Find documents that haven't been AI processed yet or were created more than 1 hour ago without control links."""
+    try:
+        db = next(get_db())
+        
+        # Find documents that either:
+        # 1. Have no control links at all (never processed)
+        # 2. Were created more than 1 hour ago and still have no control links (likely failed)
+        one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+        
+        # Find documents without any control links OR created over an hour ago
+        unprocessed = db.query(Document).outerjoin(DocumentControlLink).filter(
+            Document.created_at < one_hour_ago  # Created over 1 hour ago
+        ).group_by(Document.id).having(
+            db.func.count(DocumentControlLink.id) == 0  # No associated control links
+        ).all()
+        
+        db.close()
+        logger.info(f"Found {len(unprocessed)} unprocessed documents")
+        return unprocessed
+        
+    except Exception as e:
+        logger.error(f"Error finding unprocessed documents: {e}")
+        return []
+
+async def retry_ai_processing():
+    """Retry AI processing for unprocessed documents."""
+    try:
+        logger.info("Starting hourly AI processing retry check...")
+        unprocessed_docs = find_unprocessed_documents()
+        
+        for doc in unprocessed_docs:
+            try:
+                logger.info(f"Retrying AI processing for document: {doc.id} - {doc.filename}")
+                
+                # Download the document content from storage
+                file_content = storage.download(doc.storage_key)
+                
+                # Process in background
+                await process_document_ai_analysis_background(str(doc.id), doc.filename, file_content)
+                
+            except Exception as e:
+                logger.error(f"Failed to retry AI processing for document {doc.id}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Error during AI processing retry: {e}")
+
+async def periodic_ai_retry_task():
+    """Background task that runs every hour to retry AI processing."""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # Wait 1 hour
+            await retry_ai_processing()
+        except Exception as e:
+            logger.error(f"Error in periodic AI retry task: {e}")
+            await asyncio.sleep(300)  # Wait 5 minutes before trying again
+
+async def process_document_ai_analysis_background(document_id: str, filename: str, file_content: bytes):
+    """Process AI analysis in background and store results."""
+    try:
+        logger.info(f"Starting background AI analysis for document {document_id}: {filename}")
+        
+        # Create a mock file object for the analysis
+        class MockFile:
+            def __init__(self, filename, content):
+                self.filename = filename
+                self._content = content
+                self._position = 0
+                # Determine content type from filename
+                if filename.lower().endswith('.txt'):
+                    self.content_type = 'text/plain'
+                elif filename.lower().endswith('.pdf'):
+                    self.content_type = 'application/pdf'
+                elif filename.lower().endswith('.docx'):
+                    self.content_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                elif filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    self.content_type = 'image/' + filename.lower().split('.')[-1]
+                else:
+                    self.content_type = 'application/octet-stream'
+            
+            async def seek(self, position):
+                self._position = position
+            
+            async def read(self):
+                return self._content
+        
+        mock_file = MockFile(filename, file_content)
+        
+        # Perform the AI analysis
+        suggested_controls = await safe_analyze_file_content_for_controls(mock_file, file_content)
+        
+        if not suggested_controls:
+            # Use filename fallback if AI analysis fails - get available controls from database
+            try:
+                from sqlalchemy.orm import sessionmaker
+                from database import engine
+                from models import Control
+                SessionLocal = sessionmaker(bind=engine)
+                db = SessionLocal()
+                
+                controls = db.query(Control).all()
+                available_controls = [
+                    {
+                        'code': control.code,
+                        'title': control.title,
+                        'framework': getattr(control, 'framework_name', 'Essential Eight')
+                    }
+                    for control in controls
+                ]
+                db.close()
+                
+                suggested_controls = generate_fallback_suggestions_from_filename(filename, available_controls)[:1]
+                logger.info(f"Using filename fallback for {filename}: {len(suggested_controls)} suggestions")
+            except Exception as e:
+                logger.error(f"Failed to get fallback suggestions for {filename}: {e}")
+                suggested_controls = []
+        
+        logger.info(f"Background AI analysis completed for {filename}: {len(suggested_controls)} suggestions")
+        
+        # Store results in database for later retrieval
+        try:
+            from sqlalchemy.orm import sessionmaker
+            from database import engine
+            from models import Document, DocumentControlLink, Control
+            SessionLocal = sessionmaker(bind=engine)
+            db = SessionLocal()
+            
+            # Update document with AI processing complete status
+            document = db.query(Document).filter(Document.id == document_id).first()
+            if document and suggested_controls:
+                # Find the suggested control in database
+                control = db.query(Control).filter(Control.code == suggested_controls[0]['control_code']).first()
+                if control:
+                    # Create document-control link
+                    existing_link = db.query(DocumentControlLink).filter_by(
+                        document_id=document_id, 
+                        control_id=control.id
+                    ).first()
+                    
+                    if not existing_link:
+                        link = DocumentControlLink(
+                            document_id=document_id,
+                            control_id=control.id,
+                            confidence=suggested_controls[0].get('confidence', 0.9),
+                            reasoning=suggested_controls[0].get('reasoning', 'AI analysis')
+                        )
+                        db.add(link)
+                        db.commit()
+                        logger.info(f"Created document-control link: {document.filename} → {control.code}")
+            
+            db.close()
+        except Exception as e:
+            logger.error(f"Failed to store AI results for document {document_id}: {e}")
+        
+        logger.info(f"AI suggestions for document {document_id}: {suggested_controls}")
+        
+        return suggested_controls
+        
+    except Exception as e:
+        logger.error(f"Background AI analysis failed for document {document_id}: {e}")
+        logger.exception("Background AI analysis error details:")
         return []
 
 def extract_suggestions_from_text(text_response: str, available_controls: list) -> list:
@@ -641,7 +1254,7 @@ def extract_suggestions_from_text(text_response: str, available_controls: list) 
     text_lower = text_response.lower()
     
     # Look for mentioned control codes in the response
-    for control in available_controls[:10]:  # Check first 10 controls
+    for control in available_controls[:50]:  # Check first 50 controls with larger context
         control_code = control['code'].lower()
         control_title = control['title'].lower()
         
@@ -676,8 +1289,43 @@ def generate_fallback_suggestions_from_filename(filename: str, available_control
     suggestions = []
     filename_lower = filename.lower()
     
-    # Smart filename analysis - use tuples instead of lists for dictionary keys
-    keywords_mapping = {
+    # Specific filename patterns for Essential Eight controls
+    specific_patterns = {
+        # EE-8 Regular Backups
+        ('backup', 'recovery', 'restore', '08_backup'): ('EE-8', 'Regular Backups', 0.9),
+        # EE-7 Multi-Factor Authentication  
+        ('multi_factor', 'mfa', '2fa', '07_multi', 'authentication'): ('EE-7', 'Multi-Factor Authentication', 0.9),
+        # EE-5 Administrative Privileges
+        ('05_administrative', 'privilege', 'admin'): ('EE-5', 'Restrict Administrative Privileges', 0.9),
+        # EE-1 Application Control
+        ('01_application', 'app_control', 'software_control'): ('EE-1', 'Application Control', 0.9),
+        # EE-2 Patch Applications
+        ('02_patch', 'app_patch', 'application_patch'): ('EE-2', 'Patch Applications', 0.9),
+        # EE-6 Patch Operating Systems  
+        ('06_patch', 'os_patch', 'system_patch'): ('EE-6', 'Patch Operating Systems', 0.9),
+        # EE-3 Configure Microsoft Office Macro Settings
+        ('03_macro', 'office_macro', 'macro_settings'): ('EE-3', 'Configure Microsoft Office Macro Settings', 0.9),
+        # EE-4 User Application Hardening
+        ('04_hardening', 'browser', 'user_app'): ('EE-4', 'User Application Hardening', 0.9),
+    }
+    
+    # Check specific patterns first (highest priority)
+    for keywords, (code, title, confidence) in specific_patterns.items():
+        if any(keyword in filename_lower for keyword in keywords):
+            # Find the matching control in available_controls
+            for control in available_controls:
+                if control.get('code') == code or code in control.get('title', ''):
+                    suggestions.append({
+                        'control_code': control['code'],
+                        'control_title': control['title'],
+                        'framework_name': control.get('framework', 'Essential Eight'),
+                        'confidence': confidence,
+                        'reasoning': f'Filename indicates this is a {title.lower()} policy document'
+                    })
+                    return suggestions  # Return immediately for specific matches
+    
+    # Fallback to generic keyword mapping  
+    generic_keywords_mapping = {
         ('mfa', 'multi-factor', '2fa', 'authentication', 'auth'): 'authentication',
         ('access', 'identity', 'user', 'login'): 'access',
         ('policy', 'procedure', 'governance'): 'policy', 
@@ -686,7 +1334,7 @@ def generate_fallback_suggestions_from_filename(filename: str, available_control
         ('log', 'audit', 'monitoring', 'compliance'): 'audit'
     }
     
-    for keywords, category in keywords_mapping.items():
+    for keywords, category in generic_keywords_mapping.items():
         if any(keyword in filename_lower for keyword in keywords):
             # Find matching controls
             for control in available_controls:
@@ -781,17 +1429,40 @@ async def upload_document(
         db.commit()
         db.refresh(document)
         
-        # Perform AI content analysis for control suggestions
+        # Return immediate response without AI analysis to prevent timeouts
+        # AI analysis will be processed in background
         suggested_controls = []
+        
+        # Start background AI analysis (but don't wait for it)
+        import asyncio
         try:
-            # Analyze the file content with AI
-            await file.seek(0)  # Reset file position
-            suggested_controls = await safe_analyze_file_content_for_controls(file, file_content)
-            logger.info(f"AI analysis completed for {file.filename}, got {len(suggested_controls)} suggestions")
+            # Schedule AI analysis in background
+            asyncio.create_task(process_document_ai_analysis_background(
+                document.id, 
+                file.filename, 
+                file_content
+            ))
+            logger.info(f"Scheduled background AI analysis for {file.filename}")
         except Exception as e:
-            logger.error(f"AI content analysis failed for {file.filename}: {e}")
-            logger.exception("Full error details:")
-            # Continue without control suggestions rather than failing the upload
+            logger.error(f"Failed to schedule background AI analysis for {file.filename}: {e}")
+        
+        # Provide immediate filename-based suggestion for quick feedback
+        try:
+            # Get available controls for immediate suggestions
+            controls = db.query(Control).all()
+            available_controls = [
+                {
+                    'code': control.code,
+                    'title': control.title,
+                    'framework': getattr(control, 'framework_name', 'Essential Eight')
+                }
+                for control in controls
+            ]
+            
+            suggested_controls = generate_fallback_suggestions_from_filename(file.filename, available_controls)[:1]
+            logger.info(f"Providing immediate filename-based suggestions for {file.filename}: {len(suggested_controls)} suggestions")
+        except Exception as e:
+            logger.error(f"Filename-based suggestions failed for {file.filename}: {e}")
             suggested_controls = []
         
         return {
@@ -816,16 +1487,116 @@ async def list_documents(db: Session = Depends(get_db)):
     
     result = []
     for doc in documents:
+        # Check if document has control links (AI processing complete)
+        links = db.query(DocumentControlLink).filter(DocumentControlLink.document_id == doc.id).all()
+        
         result.append({
             "id": str(doc.id),
             "filename": doc.filename,
             "mime_type": doc.mime_type,
             "file_size": doc.file_size,
+            "sha256": doc.sha256,
             "created_at": doc.created_at.isoformat(),
-            "download_url": storage.get_download_url(doc.storage_key)
+            "download_url": f"/api/documents/{doc.id}/download",  # Fixed download URL
+            "ai_processed": len(links) > 0,
+            "control_links": [
+                {
+                    "control_id": str(link.control_id),
+                    "control_code": link.control.code if link.control else "Unknown",
+                    "control_title": link.control.title if link.control else "Unknown",
+                    "confidence": link.confidence,
+                    "reasoning": link.reasoning
+                }
+                for link in links
+            ]
         })
     
     return {"documents": result}
+
+@app.get("/documents/{document_id}/download")
+async def download_document(document_id: str, db: Session = Depends(get_db)):
+    """Download a document file."""
+    document = db.query(Document).filter(Document.id == document_id).first()
+    
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    try:
+        logger.info(f"Attempting to download document {document_id}: {document.filename}")
+        logger.info(f"Storage key: {document.storage_key}")
+        logger.info(f"MIME type: {document.mime_type}")
+        
+        # Get file content from storage
+        file_content = storage.download_file(document.storage_key)
+        
+        if not file_content:
+            logger.error(f"No file content retrieved for document {document_id}")
+            raise HTTPException(status_code=404, detail="File content not found")
+        
+        logger.info(f"Retrieved file content, size: {len(file_content)} bytes")
+        
+        from fastapi.responses import Response
+        return Response(
+            content=file_content,
+            media_type=document.mime_type,
+            headers={
+                "Content-Disposition": f"attachment; filename=\"{document.filename}\""
+            }
+        )
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        logger.error(f"Download failed for document {document_id}: {type(e).__name__}: {e}")
+        logger.error(f"Document details: filename={document.filename}, storage_key={document.storage_key}")
+        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+
+@app.get("/documents/{document_id}/ai-status")
+async def get_document_ai_status(document_id: str, db: Session = Depends(get_db)):
+    """Check if AI processing is complete for a document."""
+    try:
+        document = db.query(Document).filter(Document.id == document_id).first()
+        if not document:
+            # Document was deleted, return completed status to stop polling
+            return {
+                "document_id": document_id,
+                "filename": "Deleted Document",
+                "ai_processed": True,  # Mark as processed to stop polling
+                "control_links": [],
+                "deleted": True
+            }
+        
+        # Check if document has control links (AI processing complete)
+        links = db.query(DocumentControlLink).filter(DocumentControlLink.document_id == document_id).all()
+        
+        return {
+            "document_id": document_id,
+            "filename": document.filename,
+            "ai_processed": len(links) > 0,
+            "control_links": [
+                {
+                    "control_id": str(link.control_id),
+                    "control_code": link.control.code if link.control else "Unknown", 
+                    "control_title": link.control.title if link.control else "Unknown",
+                    "confidence": link.confidence,
+                    "reasoning": link.reasoning
+                }
+                for link in links
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Failed to get AI status for document {document_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get AI status")
+
+@app.post("/admin/retry-ai-processing")
+async def manual_retry_ai_processing():
+    """Manually trigger AI processing retry for unprocessed documents."""
+    try:
+        await retry_ai_processing()
+        return {"status": "success", "message": "AI processing retry triggered"}
+    except Exception as e:
+        logger.error(f"Failed to trigger AI processing retry: {e}")
+        raise HTTPException(status_code=500, detail="Failed to trigger AI processing retry")
 
 @app.delete("/documents/{document_id}")
 async def delete_document(document_id: str, db: Session = Depends(get_db)):
@@ -835,16 +1606,27 @@ async def delete_document(document_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Document not found")
     
     try:
-        # Delete from storage
+        # Delete from storage first
         storage.delete_file(document.storage_key)
         
-        # Delete from database
+        # Delete related records first to avoid foreign key constraint violations
+        # Delete document control links
+        db.query(DocumentControlLink).filter(DocumentControlLink.document_id == document_id).delete()
+        
+        # Delete evidence links
+        db.query(EvidenceLink).filter(EvidenceLink.document_id == document_id).delete()
+        
+        # Delete document pages (handled by relationship cascade, but explicit is better)
+        db.query(DocumentPage).filter(DocumentPage.document_id == document_id).delete()
+        
+        # Finally delete the document
         db.delete(document)
         db.commit()
         
         return {"message": "Document deleted successfully"}
         
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
 
 # Pydantic models for API requests
@@ -882,12 +1664,16 @@ async def list_controls(framework_id: str, db: Session = Depends(get_db)):
     result = []
     for control in controls:
         requirements = db.query(Requirement).filter(Requirement.control_id == control.id).all()
+        # Count linked documents for this control
+        linked_docs_count = db.query(DocumentControlLink).filter(DocumentControlLink.control_id == control.id).count()
+        
         result.append({
             "id": str(control.id),
             "code": control.code,
             "title": control.title,
             "description": control.description,
             "requirements_count": len(requirements),
+            "linked_documents_count": linked_docs_count,
             "created_at": control.created_at.isoformat()
         })
     
@@ -1009,6 +1795,46 @@ async def get_control_evidence(control_id: str, db: Session = Depends(get_db)):
         })
     
     return {"evidence": result}
+
+@app.get("/controls/{control_id}/documents")
+async def get_control_documents(control_id: str, db: Session = Depends(get_db)):
+    """Get all documents linked to a specific control via AI analysis."""
+    try:
+        control = db.query(Control).filter(Control.id == control_id).first()
+        if not control:
+            raise HTTPException(status_code=404, detail="Control not found")
+        
+        # Get all document links for this control
+        links = db.query(DocumentControlLink).filter(DocumentControlLink.control_id == control_id).all()
+        
+        documents = []
+        for link in links:
+            document = link.document
+            if document:
+                documents.append({
+                    "id": str(document.id),
+                    "filename": document.filename,
+                    "mime_type": document.mime_type,
+                    "file_size": document.file_size,
+                    "created_at": document.created_at.isoformat(),
+                    "download_url": f"/api/documents/{document.id}/download",
+                    "confidence": link.confidence,
+                    "reasoning": link.reasoning,
+                    "link_created_at": link.created_at.isoformat()
+                })
+        
+        return {
+            "control": {
+                "id": str(control.id),
+                "code": control.code,
+                "title": control.title
+            },
+            "documents": documents
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get documents for control {control_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get control documents")
 
 @app.post("/controls/{control_id}/scan")
 async def create_scan(
@@ -1630,6 +2456,11 @@ class ControlAnalysisRequest(BaseModel):
     max_tokens: Optional[int] = 1000
     temperature: Optional[float] = 0.3
 
+class DocumentBatchAnalysisRequest(BaseModel):
+    documents: List[dict]  # [{filename, content, type}]
+    controls: List[dict]   # [{code, title, framework, description, evidence_types}]
+    prompt: str
+
 @app.post("/ai/analyze-text")
 async def analyze_text_with_ai(request: ControlAnalysisRequest):
     """Analyze text using the configured AI provider."""
@@ -1654,7 +2485,8 @@ async def analyze_text_with_ai(request: ControlAnalysisRequest):
                     "stream": False,
                     "options": {
                         "temperature": request.temperature,
-                        "num_predict": request.max_tokens
+                        "num_predict": request.max_tokens,
+                        "num_ctx": int(os.getenv("OLLAMA_CONTEXT_SIZE", "32768"))
                     }
                 },
                 timeout=60
@@ -1668,6 +2500,10 @@ async def analyze_text_with_ai(request: ControlAnalysisRequest):
             
             result = response.json()
             ai_response = result.get('response', '')
+            
+            # Check thinking field if response is empty (some models use this field)
+            if not ai_response and 'thinking' in result:
+                ai_response = result.get('thinking', '')
             
         else:
             # Handle OpenAI
@@ -1699,6 +2535,129 @@ async def analyze_text_with_ai(request: ControlAnalysisRequest):
         raise HTTPException(
             status_code=500,
             detail=f"AI analysis failed: {str(e)}"
+        )
+
+@app.post("/analyze-documents")
+async def analyze_multiple_documents(request: DocumentBatchAnalysisRequest):
+    """Analyze multiple documents together and suggest relevant compliance controls."""
+    try:
+        from ai_scanner import get_ai_client
+        import json as json_module
+        
+        ai_client = get_ai_client()
+        
+        # Prepare the analysis prompt with all document information
+        documents_summary = []
+        for doc in request.documents:
+            doc_info = f"Document: {doc['filename']} ({doc['type']})"
+            if doc.get('content') and doc['content'].strip():
+                doc_info += f"\nContent preview: {doc['content'][:8000]}{'...' if len(doc['content']) > 8000 else ''}"
+            documents_summary.append(doc_info)
+        
+        controls_summary = []
+        for ctrl in request.controls:
+            ctrl_info = f"{ctrl['code']}: {ctrl['title']} ({ctrl['framework']})"
+            if ctrl.get('evidence_types'):
+                ctrl_info += f" - Evidence needed: {ctrl['evidence_types']}"
+            controls_summary.append(ctrl_info)
+        
+        enhanced_prompt = f"""
+{request.prompt}
+
+Documents to analyze:
+{chr(10).join(documents_summary)}
+
+Available compliance controls:
+{chr(10).join(controls_summary)}
+
+IMPORTANT: You must respond with ONLY valid JSON in this exact format:
+{{
+  "suggestions": [
+    {{
+      "control_code": "CONTROL_CODE",
+      "control_title": "Control Title",
+      "framework_name": "Framework Name", 
+      "confidence": 0.8,
+      "reasoning": "Brief explanation mentioning specific documents"
+    }}
+  ]
+}}
+
+Do not include any text before or after the JSON. Do not use markdown formatting. Return only the JSON object."""
+
+        result = None
+        
+        if isinstance(ai_client, dict) and ai_client.get('type') == 'ollama':
+            # Handle Ollama
+            import requests
+            
+            endpoint = ai_client['endpoint']
+            model = ai_client['model']
+            
+            response = requests.post(
+                f"{endpoint}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": enhanced_prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.3,
+                        "num_predict": 2000,
+                        "num_ctx": int(os.getenv("OLLAMA_CONTEXT_SIZE", "32768"))
+                    }
+                },
+                timeout=45  # Reduced timeout to prevent connection drops
+            )
+            
+            if response.status_code == 200:
+                result_json = response.json()
+                result = result_json.get("response", "")
+                
+                # Check thinking field if response is empty (some models use this field)
+                if not result and 'thinking' in result_json:
+                    result = result_json.get('thinking', '')
+            else:
+                raise HTTPException(status_code=500, detail=f"Ollama API error: {response.text}")
+                
+        else:
+            # Handle OpenAI
+            from openai import OpenAI
+            client = OpenAI(api_key=ai_client.api_key, base_url=ai_client.base_url)
+            
+            completion = client.chat.completions.create(
+                model=ai_client.model,
+                messages=[
+                    {"role": "system", "content": "You are a compliance expert. Analyze documents and suggest relevant compliance controls in JSON format."},
+                    {"role": "user", "content": enhanced_prompt}
+                ],
+                max_tokens=2000,
+                temperature=0.3,
+                response_format={"type": "json_object"}
+            )
+            
+            result = completion.choices[0].message.content
+        
+        # Try to parse the response as JSON
+        try:
+            if result:
+                parsed_result = _extract_json_from_response(result)
+                if parsed_result:
+                    return {"suggestions": parsed_result.get("suggestions", [])}
+                else:
+                    logger.warning(f"Could not extract JSON from batch analysis response: {result[:200]}...")
+                    return {"suggestions": []}
+            else:
+                return {"suggestions": []}
+        except Exception as e:
+            # If JSON parsing fails, return the raw result
+            logger.warning(f"Error parsing batch analysis response: {e}")
+            return {"suggestions": [], "raw_response": result}
+            
+    except Exception as e:
+        logger.error(f"Batch document analysis failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Batch analysis failed: {str(e)}"
         )
 
 @app.post("/analyze-document-controls")
@@ -1845,8 +2804,8 @@ async def analyze_document_controls(
         
         # Create analysis prompt
         controls_context = "\n".join([
-            f"- {c.get('code', 'N/A')}: {c.get('title', 'N/A')} ({c.get('framework', 'N/A')}) - {c.get('description', 'N/A')[:100]}..."
-            for c in controls[:10]  # Limit to first 10 controls to avoid token limits
+            f"- {c.get('code', 'N/A')}: {c.get('title', 'N/A')} ({c.get('framework', 'N/A')}) - {c.get('description', 'N/A')[:500]}..."
+            for c in controls[:50]  # Increased from 10 to 50 controls with larger context
         ])
         
         analysis_prompt = f"""
@@ -1885,11 +2844,25 @@ Limit to the top 3 most relevant matches. If no relevant matches, return empty a
                 f"{endpoint}/api/generate",
                 json={
                     "model": model,
-                    "prompt": analysis_prompt + "\n\nRespond only with valid JSON.",
+                    "prompt": analysis_prompt + """\n\nIMPORTANT: You must respond with ONLY valid JSON in this exact format:
+{{
+  "suggestions": [
+    {{
+      "control_code": "CONTROL_CODE",
+      "control_title": "Control Title",
+      "framework_name": "Framework Name", 
+      "confidence": 0.8,
+      "reasoning": "Brief explanation"
+    }}
+  ]
+}}
+
+Do not include any text before or after the JSON. Do not use markdown formatting. Return only the JSON object.""",
                     "stream": False,
                     "options": {
                         "temperature": 0.3,
-                        "num_predict": 500
+                        "num_predict": 500,
+                        "num_ctx": int(os.getenv("OLLAMA_CONTEXT_SIZE", "32768"))
                     }
                 },
                 timeout=60
@@ -1898,6 +2871,10 @@ Limit to the top 3 most relevant matches. If no relevant matches, return empty a
             if response.status_code == 200:
                 result = response.json()
                 ai_response = result.get('response', '')
+                
+                # Check thinking field if response is empty (some models use this field)
+                if not ai_response and 'thinking' in result:
+                    ai_response = result.get('thinking', '')
             else:
                 raise Exception(f"Ollama error: {response.status_code}")
                 
@@ -1927,7 +2904,12 @@ Limit to the top 3 most relevant matches. If no relevant matches, return empty a
         
         # Parse AI response
         try:
-            parsed_response = json_module.loads(ai_response)
+            # Use improved JSON extraction
+            parsed_response = _extract_json_from_response(ai_response)
+            if not parsed_response:
+                logger.warning(f"Could not extract JSON from AI response: {ai_response[:200]}...")
+                return {"suggested_controls": []}
+            
             suggestions = parsed_response.get('suggestions', [])
             
             # Validate and clean suggestions

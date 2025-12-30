@@ -44,7 +44,7 @@ class TextExtractor:
                 return self._extract_docx_text(file_content)
             elif mime_type == "text/plain":
                 return self._extract_txt_text(file_content)
-            elif mime_type in ["image/png", "image/jpeg"]:
+            elif mime_type in ["image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp", "image/tiff", "image/webp"]:
                 return self._extract_image_text(file_content)
             else:
                 logger.warning(f"Unsupported file type: {mime_type}")

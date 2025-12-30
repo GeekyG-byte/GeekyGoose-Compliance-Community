@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, DateTime, Integer, Text, BigInteger, ForeignKey
+from sqlalchemy import Column, String, DateTime, Integer, Text, BigInteger, ForeignKey, Float
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
@@ -90,6 +90,7 @@ class Document(Base):
     org = relationship("Org", back_populates="documents")
     uploader = relationship("User")
     pages = relationship("DocumentPage", back_populates="document")
+    control_links = relationship("DocumentControlLink", back_populates="document")
 
 class DocumentPage(Base):
     __tablename__ = "document_pages"
@@ -118,6 +119,20 @@ class EvidenceLink(Base):
     control = relationship("Control")
     requirement = relationship("Requirement")
     document = relationship("Document")
+
+class DocumentControlLink(Base):
+    __tablename__ = "document_control_links"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_id = Column(UUID(as_uuid=True), ForeignKey("documents.id"), nullable=False)
+    control_id = Column(UUID(as_uuid=True), ForeignKey("controls.id"), nullable=False)
+    confidence = Column(Float, nullable=False, default=0.0)
+    reasoning = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+    
+    document = relationship("Document", back_populates="control_links")
+    control = relationship("Control")
 
 class Scan(Base):
     __tablename__ = "scans"

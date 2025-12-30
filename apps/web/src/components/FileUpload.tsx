@@ -48,7 +48,12 @@ export default function FileUpload({ onUploadComplete, enableControlMapping = fa
     reasoning: string
   }>>([])  
   const [showMappingSuggestions, setShowMappingSuggestions] = useState(false)
-  const [lastUploadedFile, setLastUploadedFile] = useState<UploadedFile | null>(null)
+  const [lastUploadedFiles, setLastUploadedFiles] = useState<UploadedFile[]>([])
+  const [uploadProgress, setUploadProgress] = useState<{[key: string]: number}>({})
+  const [uploadResults, setUploadResults] = useState<{[key: string]: string}>({})
+  const [aiProcessingStatus, setAiProcessingStatus] = useState<Record<string, boolean>>({})
+  const [showAiCompleteBanner, setShowAiCompleteBanner] = useState(false)
+  const [aiCompleteMessage, setAiCompleteMessage] = useState('')
 
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault()
@@ -56,56 +61,234 @@ export default function FileUpload({ onUploadComplete, enableControlMapping = fa
     
     const files = Array.from(e.dataTransfer.files)
     if (files.length > 0) {
-      await uploadFile(files[0])
+      await uploadMultipleFiles(files)
     }
   }
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files
     if (files && files.length > 0) {
-      await uploadFile(files[0])
+      await uploadMultipleFiles(Array.from(files))
     }
   }
 
-  const uploadFile = async (file: File) => {
+  const uploadMultipleFiles = async (files: File[]) => {
+    if (files.length === 0) return
+    
     setIsUploading(true)
-    setUploadStatus(null)
+    setUploadStatus(`Uploading ${files.length} file${files.length > 1 ? 's' : ''} one at a time...`)
+    setUploadResults({})
+    setUploadProgress({})
+    setLastUploadedFiles([])
+    
+    const uploadedFiles: UploadedFile[] = []
+    const successfulFiles: File[] = []
+    let successful = 0
+    let failed = 0
+    
+    // Upload files sequentially to prevent connection issues
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index]
+      const fileKey = `${file.name}-${index}`
+      
+      setUploadStatus(`Uploading file ${index + 1} of ${files.length}: ${file.name}`)
+      setUploadProgress(prev => ({ ...prev, [fileKey]: 0 }))
+      
+      try {
+        const result = await uploadFile(file)
+        setUploadResults(prev => ({ ...prev, [fileKey]: '✅ Uploaded' }))
+        uploadedFiles.push(result)
+        successfulFiles.push(file)
+        successful++
+        
+        // Delay between uploads to prevent overwhelming the server
+        if (index < files.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 2000)) // Increased to 2 seconds
+        }
+      } catch (error: any) {
+        let errorMessage = '❌ Failed'
+        if (error.message?.includes('timeout')) {
+          errorMessage = '⏰ Timeout'
+        } else if (error.message?.includes('Connection lost')) {
+          errorMessage = '🔌 Connection lost'
+        }
+        setUploadResults(prev => ({ ...prev, [fileKey]: errorMessage }))
+        console.error(`Upload failed for ${file.name}:`, error)
+        failed++
+      }
+    }
+    
+    setUploadStatus(`Upload complete: ${successful} successful${failed > 0 ? `, ${failed} failed` : ''}`)
+    setLastUploadedFiles(uploadedFiles)
+    
+    // Always check for AI control mapping if files were uploaded
+    if (uploadedFiles.length > 0) {
+      await scanMultipleFilesForControlMatches(successfulFiles, uploadedFiles)
+      
+      // Start polling for AI processing completion
+      startAiProcessingPolling(uploadedFiles)
+    }
+    
+    setIsUploading(false)
+    onUploadComplete?.()
+  }
 
+  const uploadFile = async (file: File): Promise<UploadedFile> => {
     const formData = new FormData()
     formData.append('file', file)
+
+    // Create an AbortController for timeout handling
+    const abortController = new AbortController()
+    const timeoutId = setTimeout(() => abortController.abort(), 120000) // 2 minute timeout for large files
 
     try {
       const response = await fetch('/api/documents/upload', {
         method: 'POST',
         body: formData,
+        signal: abortController.signal,
+        // Add keep-alive headers to prevent connection drops
+        headers: {
+          'Connection': 'keep-alive',
+        },
       })
+
+      clearTimeout(timeoutId)
 
       if (response.ok) {
         const result = await response.json()
-        setLastUploadedFile(result)
         
-        // If control mapping is enabled and we got suggestions from the server
-        if (enableControlMapping && result.suggested_controls && result.suggested_controls.length > 0) {
-          setSuggestedMappings(result.suggested_controls)
-          setShowMappingSuggestions(true)
-          const displayName = file.name.split('\\').pop()?.split('/').pop() || file.name
-          setUploadStatus(`✅ Upload complete • AI found ${result.suggested_controls.length} control matches for ${displayName}`)
-        } else if (enableControlMapping) {
-          // Fallback to client-side analysis if no server suggestions
-          await scanFileForControlMatches(file, result)
-        } else {
-          setUploadStatus(`✅ Successfully uploaded: ${result.filename}`)
+        // Check if backend provided control suggestions
+        if (result.suggested_controls && result.suggested_controls.length > 0) {
+          console.log(`Backend provided ${result.suggested_controls.length} control suggestions for ${file.name}`)
+          
+          // Store the backend suggestions for use after upload
+          result._backendSuggestions = result.suggested_controls
         }
-        
-        onUploadComplete?.()
+
+        return result
       } else {
         const error = await response.json()
-        setUploadStatus(`❌ Upload failed: ${error.detail}`)
+        throw new Error(error.detail || 'Upload failed')
       }
+    } catch (error: any) {
+      clearTimeout(timeoutId)
+      
+      const errorMessage = error?.message || String(error)
+      const errorName = error?.name || ''
+      
+      if (errorName === 'AbortError') {
+        throw new Error('Upload timeout - file may be too large or server is slow')
+      } else if (errorMessage.includes('ECONNRESET') || errorMessage.includes('socket hang up')) {
+        throw new Error('Connection lost - please try again')
+      } else if (errorMessage.includes('Failed to fetch')) {
+        throw new Error('Network error - please check your connection')
+      }
+      throw new Error(errorMessage || 'Upload failed')
+    }
+  }
+
+  const startAiProcessingPolling = (uploadedFiles: UploadedFile[]) => {
+    // Set initial AI processing status
+    const initialStatus: Record<string, boolean> = {}
+    uploadedFiles.forEach(file => {
+      initialStatus[file.id] = false
+    })
+    setAiProcessingStatus(initialStatus)
+    
+    // Process files sequentially instead of polling all at once
+    processFilesSequentially(uploadedFiles, 0)
+  }
+
+  const processFilesSequentially = async (uploadedFiles: UploadedFile[], currentIndex: number) => {
+    if (currentIndex >= uploadedFiles.length) {
+      // All files processed
+      setAiCompleteMessage(`🎉 AI analysis complete! ${uploadedFiles.length} document${uploadedFiles.length > 1 ? 's' : ''} automatically linked to controls.`)
+      setShowAiCompleteBanner(true)
+      setTimeout(() => setShowAiCompleteBanner(false), 5000)
+      onUploadComplete?.()
+      return
+    }
+
+    const file = uploadedFiles[currentIndex]
+    setUploadStatus(`🧠 AI analyzing document ${currentIndex + 1} of ${uploadedFiles.length}: ${file.filename}`)
+    
+    // Poll this specific file until completion
+    const pollInterval = setInterval(async () => {
+      try {
+        const response = await fetch(`/api/documents/${file.id}/ai-status`)
+        if (response.ok) {
+          const data = await response.json()
+          if (data.ai_processed) {
+            clearInterval(pollInterval)
+            setAiProcessingStatus(prev => ({ ...prev, [file.id]: true }))
+            
+            // Handle deleted documents gracefully
+            if (data.deleted) {
+              console.warn(`Document ${file.filename} was deleted during processing`)
+            }
+            
+            // Process next file
+            setTimeout(() => {
+              processFilesSequentially(uploadedFiles, currentIndex + 1)
+            }, 1000) // Small delay between files
+          }
+        } else if (response.status === 404) {
+          // Document was deleted, stop polling and continue with next file
+          console.warn(`Document ${file.filename} was deleted, stopping AI status polling`)
+          clearInterval(pollInterval)
+          processFilesSequentially(uploadedFiles, currentIndex + 1)
+        } else {
+          // Other errors, log and continue polling for a bit
+          console.warn(`AI status check failed for ${file.filename}: ${response.status}`)
+        }
+      } catch (error) {
+        console.error(`Failed to check AI status for ${file.filename}:`, error)
+        clearInterval(pollInterval)
+        // Continue with next file even if this one fails
+        processFilesSequentially(uploadedFiles, currentIndex + 1)
+      }
+    }, 3000)
+    
+    // Timeout after 5 minutes per file
+    setTimeout(() => {
+      clearInterval(pollInterval)
+      console.warn(`AI processing timeout for ${file.filename}`)
+      processFilesSequentially(uploadedFiles, currentIndex + 1)
+    }, 300000)
+  }
+
+  const scanMultipleFilesForControlMatches = async (files: File[], uploadedFiles: UploadedFile[]) => {
+    setScanningForControls(true)
+    setUploadStatus(`🔍 AI scanning ${files.length} document${files.length > 1 ? 's' : ''} for control mappings...`)
+    
+    try {
+      // First, check if any uploaded files have backend suggestions
+      const backendSuggestions = []
+      for (const uploadedFile of uploadedFiles) {
+        if ((uploadedFile as any)._backendSuggestions) {
+          const suggestions = (uploadedFile as any)._backendSuggestions
+          console.log(`Using backend suggestions for ${uploadedFile.filename}:`, suggestions)
+          backendSuggestions.push(...suggestions)
+        }
+      }
+      
+      if (backendSuggestions.length > 0) {
+        console.log(`Found ${backendSuggestions.length} backend suggestions, using those for one-to-one document mapping`)
+        setSuggestedMappings(backendSuggestions)
+        setShowMappingSuggestions(true)
+        setUploadStatus(`✅ Upload complete • Found ${backendSuggestions.length} control match${backendSuggestions.length !== 1 ? 'es' : ''} based on filename analysis`)
+        setScanningForControls(false)
+        return
+      }
+      
+      console.log('No backend suggestions found')
+      setUploadStatus(`✅ Upload complete • No control suggestions available`)
+      
     } catch (error) {
-      setUploadStatus(`❌ Upload failed: ${error}`)
+      console.error('Multi-file control mapping failed:', error)
+      setUploadStatus(`✅ Upload complete • AI analysis unavailable`)
     } finally {
-      setIsUploading(false)
+      setScanningForControls(false)
     }
   }
 
@@ -180,7 +363,7 @@ Analyze the following document and determine which compliance controls it might 
 
 Document filename: ${filename}
 Document type: ${file.type}
-File content preview: ${fileContent.substring(0, 1000)}${fileContent.length > 1000 ? '...' : ''}
+File content preview: ${fileContent.substring(0, 5000)}${fileContent.length > 5000 ? '...' : ''}
 
 Available compliance controls:
 ${controlsContext.map(c => `${c.code}: ${c.title} (${c.framework}) - Evidence needed: ${c.evidence_types}`).join('\n')}
@@ -236,6 +419,160 @@ Limit to the top 3 most relevant matches. If no relevant matches, return empty a
     }
   }
   
+  const analyzeMultipleDocumentsWithAI = async (files: File[], uploadedFiles: UploadedFile[], templates: Template[]) => {
+    try {
+      // Process each document individually to ensure one-to-one mapping
+      const allSuggestions = []
+      
+      // Read content from all text files
+      const fileContents: { filename: string, content: string, type: string, originalFilename: string }[] = []
+      
+      for (const file of files) {
+        const filename = file.name.split('\\').pop()?.split('/').pop()?.toLowerCase() || file.name.toLowerCase()
+        let content = ''
+        
+        if (file.type === 'text/plain' || filename.endsWith('.txt')) {
+          try {
+            content = await file.text()
+          } catch (error) {
+            console.log(`Could not read file content for ${filename}, using filename analysis only`)
+          }
+        }
+        
+        fileContents.push({
+          filename,
+          content: content.substring(0, 10000), // Increased content length for larger context
+          type: file.type,
+          originalFilename: file.name
+        })
+      }
+      
+      // Prepare control context for AI
+      const controlsContext = templates.map(t => ({
+        code: t.control.code,
+        title: t.control.title,
+        framework: t.control.framework_name,
+        description: t.description,
+        evidence_types: t.evidence_requirements.map(req => req.evidence_type).join(', '),
+        evidence_descriptions: t.evidence_requirements.map(req => req.description).join(' | ')
+      }))
+      
+      // Analyze each document individually to get one control per document
+      for (const fileContent of fileContents) {
+        const singleDocumentPrompt = `
+Analyze this single document and find the ONE MOST RELEVANT compliance control for it.
+
+Document:
+File: ${fileContent.filename} (${fileContent.type})
+${fileContent.content ? 'Content preview: ' + fileContent.content.substring(0, 3000) + '...' : ''}
+
+Available compliance controls:
+${controlsContext.map(c => `${c.code}: ${c.title} (${c.framework}) - Evidence needed: ${c.evidence_types}`).join('\n')}
+
+Return the single best control match for this specific document.
+Respond in JSON format with a "suggestions" array containing exactly ONE object with: control_code, control_title, framework_name, confidence, reasoning, document_name.
+If no relevant match, return empty array.
+Focus on the specific content and purpose of this individual document.`
+        
+        try {
+          // Call backend AI service for individual document analysis
+          const response = await fetch('/api/analyze-documents', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              documents: [fileContent],
+              controls: controlsContext,
+              prompt: singleDocumentPrompt
+            })
+          })
+          
+          if (response.ok) {
+            const result = await response.json()
+            
+            try {
+              // Try to parse AI response as JSON
+              const aiResponse = typeof result.suggestions === 'string' ? JSON.parse(result.suggestions) : result
+              if (aiResponse.suggestions && Array.isArray(aiResponse.suggestions) && aiResponse.suggestions.length > 0) {
+                const suggestion = aiResponse.suggestions[0] // Take only the first suggestion
+                allSuggestions.push({
+                  control_code: suggestion.control_code || '',
+                  control_title: suggestion.control_title || '',
+                  framework_name: suggestion.framework_name || '',
+                  confidence: Math.min(Math.max(suggestion.confidence || 0, 0), 1),
+                  reasoning: suggestion.reasoning || 'AI-generated individual analysis',
+                  document_name: fileContent.originalFilename
+                })
+              } else {
+                // Generate fallback suggestion for this specific document
+                const fallbackSuggestions = generateFallbackSuggestions(fileContent.filename, templates)
+                if (fallbackSuggestions.length > 0) {
+                  allSuggestions.push({
+                    ...fallbackSuggestions[0],
+                    document_name: fileContent.originalFilename
+                  })
+                }
+              }
+            } catch (parseError) {
+              console.error(`Failed to parse AI response for ${fileContent.filename}:`, parseError)
+              // Generate fallback suggestion for this document
+              const fallbackSuggestions = generateFallbackSuggestions(fileContent.filename, templates)
+              if (fallbackSuggestions.length > 0) {
+                allSuggestions.push({
+                  ...fallbackSuggestions[0],
+                  document_name: fileContent.originalFilename
+                })
+              }
+            }
+          } else {
+            // Generate fallback suggestion for this document
+            const fallbackSuggestions = generateFallbackSuggestions(fileContent.filename, templates)
+            if (fallbackSuggestions.length > 0) {
+              allSuggestions.push({
+                ...fallbackSuggestions[0],
+                document_name: fileContent.originalFilename
+              })
+            }
+          }
+        } catch (error) {
+          console.error(`AI analysis failed for ${fileContent.filename}:`, error)
+          // Generate fallback suggestion for this document
+          const fallbackSuggestions = generateFallbackSuggestions(fileContent.filename, templates)
+          if (fallbackSuggestions.length > 0) {
+            allSuggestions.push({
+              ...fallbackSuggestions[0],
+              document_name: fileContent.originalFilename
+            })
+          }
+        }
+      }
+      
+      return allSuggestions
+      
+    } catch (error) {
+      console.error('AI batch analysis failed:', error)
+      
+      // Fallback to filename-based analysis for all files
+      const fallbackSuggestions = []
+      for (const file of files) {
+        const cleanFilename = file.name.split('\\').pop()?.split('/').pop()?.toLowerCase() || file.name.toLowerCase()
+        const suggestions = generateFallbackSuggestions(cleanFilename, templates)
+        fallbackSuggestions.push(...suggestions)
+      }
+      
+      // Deduplicate and limit
+      const uniqueSuggestions = fallbackSuggestions.reduce((acc, curr) => {
+        if (!acc.find(s => s.control_code === curr.control_code)) {
+          acc.push(curr)
+        }
+        return acc
+      }, [] as typeof fallbackSuggestions)
+      
+      return uniqueSuggestions.slice(0, 5)
+    }
+  }
+
   const generateFallbackSuggestions = (filename: string, templates: Template[]) => {
     const suggestions = []
     
@@ -344,26 +681,41 @@ Limit to the top 3 most relevant matches. If no relevant matches, return empty a
   }
   
   const linkToControl = (suggestion: typeof suggestedMappings[0]) => {
-    // Store the mapping suggestion in localStorage for potential use
-    const mappingSuggestion = {
-      file_id: lastUploadedFile?.id,
-      filename: lastUploadedFile?.filename,
-      control_code: suggestion.control_code,
-      control_title: suggestion.control_title,
-      framework_name: suggestion.framework_name,
-      confidence: suggestion.confidence,
-      reasoning: suggestion.reasoning,
-      created_at: new Date().toISOString()
-    }
-    
+    // Store mapping suggestions for all uploaded files
     const existingMappings = localStorage.getItem('document_control_mappings')
     const mappings = existingMappings ? JSON.parse(existingMappings) : []
-    mappings.unshift(mappingSuggestion)
+    
+    // Create mappings for all recently uploaded files
+    lastUploadedFiles.forEach(file => {
+      const mappingSuggestion = {
+        file_id: file.id,
+        filename: file.filename,
+        control_code: suggestion.control_code,
+        control_title: suggestion.control_title,
+        framework_name: suggestion.framework_name,
+        confidence: suggestion.confidence,
+        reasoning: suggestion.reasoning,
+        created_at: new Date().toISOString()
+      }
+      mappings.unshift(mappingSuggestion)
+    })
+    
     localStorage.setItem('document_control_mappings', JSON.stringify(mappings))
     
-    setUploadStatus(`✅ Document linked to ${suggestion.control_code} - ${suggestion.control_title}`)
-    setShowMappingSuggestions(false)
-    setSuggestedMappings([])
+    const fileCount = lastUploadedFiles.length
+    
+    // Remove the linked suggestion from the list instead of clearing all
+    const remainingSuggestions = suggestedMappings.filter(s => s.control_code !== suggestion.control_code)
+    setSuggestedMappings(remainingSuggestions)
+    
+    // Update status with success message
+    setUploadStatus(`✅ ${fileCount} document${fileCount > 1 ? 's' : ''} linked to ${suggestion.control_code} - ${suggestion.control_title}`)
+    
+    // Only hide suggestions dialog if no more suggestions remain
+    if (remainingSuggestions.length === 0) {
+      setShowMappingSuggestions(false)
+      setUploadStatus(`✅ All documents linked to controls`)
+    }
   }
 
   const formatFileSize = (bytes: number) => {
@@ -376,6 +728,21 @@ Limit to the top 3 most relevant matches. If no relevant matches, return empty a
 
   return (
     <div className="w-full max-w-lg mx-auto">
+      {/* AI Processing Complete Banner */}
+      {showAiCompleteBanner && (
+        <div className="bg-green-50 border border-green-200 rounded-lg p-4 mb-4 animate-pulse">
+          <div className="flex items-center">
+            <div className="flex-shrink-0">
+              <span className="text-2xl">🎉</span>
+            </div>
+            <div className="ml-3">
+              <h3 className="text-sm font-medium text-green-800">{aiCompleteMessage}</h3>
+              <p className="text-xs text-green-600 mt-1">Documents have been automatically linked to their relevant compliance controls.</p>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div
         className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
           isDragging
@@ -397,17 +764,24 @@ Limit to the top 3 most relevant matches. If no relevant matches, return empty a
               Drop files here or click to browse
             </h3>
             <p className="text-sm text-gray-500 mt-1">
-              Supports: PDF, DOCX, TXT, PNG, JPG (max 50MB)
+              Supports: PDF, DOCX, TXT, Images (PNG, JPG, GIF, BMP, TIFF, WebP)
+            </p>
+            <p className="text-xs text-gray-400 mt-1">
+              ✨ Select multiple files for batch upload and AI scanning
+            </p>
+            <p className="text-xs text-green-600 mt-1 font-medium">
+              📸 Images are automatically scanned with OCR to extract text
             </p>
           </div>
 
           <input
             type="file"
             onChange={handleFileSelect}
-            accept=".pdf,.docx,.txt,.png,.jpg,.jpeg"
+            accept=".pdf,.docx,.txt,.png,.jpg,.jpeg,.gif,.bmp,.tiff,.webp"
             className="hidden"
             id="file-input"
             disabled={isUploading}
+            multiple
           />
           
           <label
@@ -435,6 +809,50 @@ Limit to the top 3 most relevant matches. If no relevant matches, return empty a
           {uploadStatus}
         </div>
       )}
+
+      {/* AI Processing Status Indicator */}
+      {Object.keys(aiProcessingStatus).length > 0 && (
+        <div className="mt-4 p-3 rounded-lg bg-blue-50 border border-blue-200">
+          <div className="flex items-center mb-2">
+            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600 mr-2"></div>
+            <span className="text-sm font-medium text-blue-900">🧠 AI Analysis in Progress</span>
+          </div>
+          <div className="text-xs text-blue-700">
+            {Object.entries(aiProcessingStatus).map(([fileId, completed]) => {
+              const file = lastUploadedFiles.find(f => f.id === fileId)
+              if (!file) return null
+              return (
+                <div key={fileId} className="flex items-center justify-between py-1">
+                  <span className="truncate max-w-xs">{file.filename.split('/').pop()}</span>
+                  <span className={`ml-2 ${completed ? 'text-green-600' : 'text-blue-600'}`}>
+                    {completed ? '✅ Linked' : '⏳ Processing'}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+          <div className="text-xs text-blue-600 mt-2">
+            Documents will be automatically linked to controls when analysis completes.
+          </div>
+        </div>
+      )}
+      
+      {/* Individual File Upload Results */}
+      {Object.keys(uploadResults).length > 0 && (
+        <div className="mt-3 space-y-2">
+          {Object.entries(uploadResults).map(([fileKey, status]) => {
+            const fileName = fileKey.split('-').slice(0, -1).join('-') // Remove the index
+            return (
+              <div key={fileKey} className="flex items-center justify-between text-xs p-2 bg-white border border-gray-200 rounded">
+                <span className="flex-1 truncate">{fileName}</span>
+                <span className={`ml-2 ${status.includes('✅') ? 'text-green-600' : 'text-red-600'}`}>
+                  {status}
+                </span>
+              </div>
+            )
+          })}
+        </div>
+      )}
       
       {/* Control Mapping Suggestions */}
       {enableControlMapping && showMappingSuggestions && suggestedMappings.length > 0 && (
@@ -444,7 +862,11 @@ Limit to the top 3 most relevant matches. If no relevant matches, return empty a
             <h4 className="font-medium text-blue-900">Suggested Control Mappings</h4>
           </div>
           <p className="text-sm text-blue-700 mb-3">
-            Based on the analysis of <strong>{lastUploadedFile?.filename?.split('\\').pop()?.split('/').pop() || lastUploadedFile?.filename}</strong>, here are potential compliance control matches:
+            {lastUploadedFiles.length > 1 ? (
+              <>Based on the analysis of <strong>{lastUploadedFiles.length} uploaded documents</strong>, here are potential compliance control matches:</>
+            ) : (
+              <>Based on the analysis of <strong>{lastUploadedFiles[0]?.filename?.split('\\').pop()?.split('/').pop() || lastUploadedFiles[0]?.filename}</strong>, here are potential compliance control matches:</>
+            )}
           </p>
           
           <div className="space-y-3">
@@ -460,6 +882,28 @@ Limit to the top 3 most relevant matches. If no relevant matches, return empty a
                         {suggestion.framework_name}
                       </span>
                     </div>
+                    
+                    {/* Document names section */}
+                    <div className="mb-2">
+                      <div className="flex items-center mb-1">
+                        <span className="text-xs font-medium text-gray-700 mr-2">📄 Documents:</span>
+                        <span className="text-xs text-gray-600">
+                          {lastUploadedFiles.length} file{lastUploadedFiles.length !== 1 ? 's' : ''}
+                        </span>
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {lastUploadedFiles.map((file, fileIndex) => (
+                          <span 
+                            key={fileIndex}
+                            className="inline-block bg-gray-100 text-gray-700 px-2 py-1 rounded text-xs max-w-[200px] truncate"
+                            title={file.filename}
+                          >
+                            {file.filename.split('/').pop()?.split('\\').pop() || file.filename}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    
                     <div className="flex items-center mb-2">
                       <div className="flex items-center mr-3">
                         <div className={`w-2 h-2 rounded-full mr-1 ${

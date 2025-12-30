@@ -12,6 +12,8 @@
 ## ✨ Features
 
 ### 🤖 **AI-Powered Compliance Scanning**
+- **Two-Step Document Analysis**: First scan and summarize, then map to controls
+- **Structured Output Processing**: Reliable AI responses with fallback handling  
 - **Automated Evidence Analysis**: Upload policies, screenshots, and documents
 - **Smart Gap Detection**: AI identifies what's missing and why
 - **Compliance Scoring**: Pass/Partial/Fail ratings with confidence levels
@@ -46,7 +48,7 @@
 
 ## 🏗️ Architecture
 
-### **Frontend** (Next.js 15)
+### **Frontend** (Next.js 16.1.1)
 - **App Router**: Modern Next.js routing with TypeScript
 - **Tailwind CSS + shadcn/ui**: Beautiful, accessible components
 - **Server Actions**: Optimized data mutations
@@ -59,10 +61,11 @@
 - **Redis**: Background job queue for AI processing
 
 ### **AI Processing**
-- **Ollama Integration**: Local LLM support for data privacy
+- **Ollama Integration**: Local LLM support with large context windows (32K+ tokens)
 - **OpenAI Compatible**: Support for GPT-4 and other models
 - **Structured Output**: JSON schema validation for reliable results
 - **Document Extraction**: PDF, DOCX parsing with OCR fallback
+- **High-Memory Optimization**: Configured for 16GB+ systems with comprehensive document analysis
 
 ### **Infrastructure**
 - **Docker Compose**: Complete development environment
@@ -205,15 +208,27 @@ docker-compose exec api alembic upgrade head
 # Install Ollama locally
 curl -fsSL https://ollama.com/install.sh | sh
 
-# Pull recommended models
-ollama pull qwen3:8b
-ollama pull gemma3:4b
+# Pull recommended models for 16GB+ RAM systems
+ollama pull qwen2.5:14b          # Best for comprehensive analysis (16GB+ RAM)
+ollama pull llama3.1:8b          # Good balance of speed and quality
+ollama pull mistral:7b           # Fast and efficient
 
 # Configure in .env
 OLLAMA_ENDPOINT=http://localhost:11434
-OLLAMA_MODEL=qwen3:8b
+OLLAMA_MODEL=qwen2.5:14b         # Large model with 32K context window
+OLLAMA_CONTEXT_SIZE=32768        # Maximize context for comprehensive analysis
 AI_PROVIDER=ollama
+
+# For systems with more RAM, you can increase context size:
+# OLLAMA_CONTEXT_SIZE=65536       # 64K context (requires 32GB+ RAM)
+# OLLAMA_CONTEXT_SIZE=131072      # 128K context (requires 64GB+ RAM)
 ```
+
+**💡 Context Window Benefits:**
+- **Larger Documents**: Analyze complete policy documents without truncation
+- **Batch Processing**: Process multiple files together for better context
+- **Comprehensive Analysis**: AI can consider full document relationships
+- **Better Accuracy**: More context leads to more accurate compliance mapping
 
 ### **OpenAI API**
 ```bash
@@ -311,6 +326,78 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **SLA Support**: As-IS
 
 ## 📅 Changelog
+
+### **v0.3.0** - Enhanced File Processing & Infrastructure Improvements (December 2025)
+
+#### 🆕 **New Features**
+- **Enhanced Image Processing with OCR**: Complete picture scanning capability with text extraction
+  - **Multi-Format Support**: PNG, JPG, GIF, BMP, TIFF, WebP image processing
+  - **OCR Text Extraction**: Tesseract integration for automatic text recognition from images
+  - **Visual Evidence Analysis**: AI can analyze screenshots, configuration images, and policy scans
+  - **Batch Image Upload**: Upload multiple images simultaneously for comprehensive analysis
+  - **Smart Content Detection**: AI identifies compliance-relevant content in visual documents
+
+- **Improved File Upload System**: Sequential processing for better reliability
+  - **Multi-File Selection**: Select multiple files at once for batch processing
+  - **Sequential Upload**: One-at-a-time upload to prevent connection timeout issues
+  - **Enhanced Progress Tracking**: Real-time feedback during multi-file uploads
+  - **Better Error Handling**: Robust error recovery and user feedback
+  - **Connection Stability**: Prevents socket hang-up errors during large uploads
+
+- **Fixed Document Download System**: Reliable file retrieval and storage
+  - **Fixed Storage Integration**: Corrected MinIO storage method calls
+  - **Enhanced Error Logging**: Detailed logging for troubleshooting download issues
+  - **Reliable File Access**: Proper file content retrieval from object storage
+  - **Better Error Messages**: Clear feedback when downloads fail
+
+#### 🔧 **Technical Improvements**
+- **Next.js 16.1.1 Upgrade**: Latest React 19 compatibility and performance improvements
+  - **React 19**: Updated to latest React version with new features
+  - **ESLint 9**: Modern linting configuration for better code quality
+  - **Dependency Optimization**: Moved dev dependencies to production for deployment
+  - **Improved Build Performance**: Faster builds and better development experience
+
+- **Enhanced AI Processing**: More reliable AI responses and better JSON handling
+  - **Completions-Only API**: Switched from chat to completions format for Ollama integration
+  - **Improved JSON Parsing**: Better handling of AI responses with strict JSON validation
+  - **Increased Content Length**: Extended AI response limits from 200 to 500 tokens
+  - **Better Error Handling**: Graceful fallbacks when AI processing fails
+  - **Simplified Prompts**: More effective AI prompts for better compliance analysis
+
+- **Database Improvements**: Enhanced data integrity and relationship handling
+  - **Fixed Foreign Key Constraints**: Proper cascade deletion for document relationships
+  - **Better Error Handling**: Resolved database constraint violation errors
+  - **Improved Data Consistency**: Proper cleanup of related records during deletions
+  - **Enhanced Logging**: Better error tracking for database operations
+
+#### 🎨 **UI/UX Enhancements**
+- **Responsive Document Display**: Fixed overflow issues in document management
+  - **Container Boundaries**: Documents properly contained within UI boundaries
+  - **Text Truncation**: Long filenames and titles properly truncated with tooltips
+  - **Mobile Responsive**: Better display on mobile and tablet devices
+  - **Improved Layout**: Better spacing and visual hierarchy
+
+- **Enhanced File Type Support**: Clear indication of supported formats
+  - **Visual File Icons**: Different icons for PDF, Word, text, and image files
+  - **Format Guidance**: Clear indication of supported file types and size limits
+  - **OCR Indicators**: Visual feedback when OCR text extraction is used
+  - **File Size Display**: Better formatting of file size information
+
+#### 🐛 **Bug Fixes**
+- Fixed document download failures due to incorrect storage method calls
+- Resolved socket hang-up errors during multiple file uploads
+- Fixed database foreign key constraint violations during document deletion
+- Corrected AI JSON parsing warnings and response truncation issues
+- Resolved Next.js 16.1.1 compatibility issues with dependencies
+- Fixed overflow issues in document display containers
+- Corrected OCR text extraction for various image formats
+
+#### 🚀 **Performance Improvements**
+- Sequential file upload reduces server load and connection timeouts
+- Enhanced AI response processing with better content limits
+- Improved database query efficiency for document operations
+- Better memory management during large file processing
+- Optimized image processing pipeline for OCR extraction
 
 ### **v0.2.1** - Enhanced Policy Generation & Submission Management (December 2025)
 

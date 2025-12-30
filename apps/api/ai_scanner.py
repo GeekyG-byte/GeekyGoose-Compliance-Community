@@ -253,10 +253,10 @@ REQUIREMENTS TO EVALUATE:
         
         for i, evidence in enumerate(evidence_texts):
             prompt += f"\nDocument {i+1}: {evidence['document_name']} (Page {evidence['page_num']})\n"
-            # Truncate very long evidence to avoid token limits
+            # Allow much larger evidence with expanded context window
             text = evidence['text']
-            if len(text) > 2000:
-                text = text[:2000] + "... [truncated]"
+            if len(text) > 15000:  # Increased from 2000 to 15000 characters
+                text = text[:15000] + "... [truncated]"
             prompt += f"Content: {text}\n"
         
         # Add instructions
@@ -342,10 +342,11 @@ Respond only with valid JSON. No additional text."""
                     "stream": False,
                     "options": {
                         "temperature": 0.1,
-                        "top_p": 0.9
+                        "top_p": 0.9,
+                        "num_ctx": int(os.getenv("OLLAMA_CONTEXT_SIZE", "32768"))  # Configurable context window
                     }
                 },
-                timeout=120  # Longer timeout for complex analysis
+                timeout=45  # Reduced timeout to prevent connection drops
             )
             
             if response.status_code != 200:

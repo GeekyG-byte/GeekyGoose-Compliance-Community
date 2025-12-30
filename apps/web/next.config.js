@@ -1,8 +1,5 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  experimental: {
-    appDir: true,
-  },
   // Configure rewrites for API calls to backend container
   async rewrites() {
     return [
@@ -15,6 +12,20 @@ const nextConfig = {
   // Allow external access from LAN
   env: {
     HOSTNAME: '0.0.0.0',
+  },
+  // Configure server timeouts for large file uploads
+  serverRuntimeConfig: {
+    // Increase timeout for API routes
+    maxDuration: 300, // 5 minutes
+  },
+  // Configure for development proxy
+  devIndicators: {
+    buildActivity: false,
+  },
+  // New Next.js 16 features
+  experimental: {
+    // Enable optimizations for better performance
+    optimizePackageImports: ['lucide-react', '@radix-ui/react-slot'],
   },
 }
 

@@ -61,7 +61,11 @@ services:
       MINIO_SECRET_KEY: minioadmin123
       MINIO_BUCKET: geekygoose-docs
       JWT_SECRET: dev_jwt_secret_change_in_production
+      AI_PROVIDER: ${AI_PROVIDER:-ollama}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OLLAMA_ENDPOINT: ${OLLAMA_ENDPOINT:-http://localhost:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:14b}
+      OLLAMA_CONTEXT_SIZE: ${OLLAMA_CONTEXT_SIZE:-32768}
     # Internal port only - accessible through web service
     expose:
       - "8000"
@@ -74,7 +78,7 @@ services:
     networks:
       - backend
       - frontend  # Also on frontend network to communicate with web
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --timeout-keep-alive 300 --timeout-graceful-shutdown 300
 
   web:
     build:
@@ -115,9 +119,10 @@ services:
       MINIO_SECRET_KEY: minioadmin123
       MINIO_BUCKET: geekygoose-docs
       OPENAI_API_KEY: ${OPENAI_API_KEY}
-      AI_PROVIDER: ollama
-      OLLAMA_ENDPOINT: http://172.16.0.11:11434
-      OLLAMA_MODEL: qwen3:8b
+      AI_PROVIDER: ${AI_PROVIDER:-ollama}
+      OLLAMA_ENDPOINT: ${OLLAMA_ENDPOINT:-http://localhost:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:14b}
+      OLLAMA_CONTEXT_SIZE: ${OLLAMA_CONTEXT_SIZE:-32768}
     depends_on:
       - postgres
       - redis
