@@ -70,7 +70,7 @@ Return JSON summary:
                 "stream": False,
                 "options": {
                     "temperature": 0.1,
-                    "num_predict": 400,  # Much longer for complete JSON
+                    "num_predict": 1000,  # Increased for complete JSON responses
                     "num_ctx": int(os.getenv("OLLAMA_CONTEXT_SIZE", "32768")),
                     "stop": ["\n\n\n"]  # Only stop on triple newlines
                 }
@@ -134,7 +134,7 @@ Return control mapping JSON:
                 "stream": False,
                 "options": {
                     "temperature": 0.1,
-                    "num_predict": 300,  # Much longer for complete JSON
+                    "num_predict": 600,  # Increased for complete JSON responses with reasoning
                     "num_ctx": int(os.getenv("OLLAMA_CONTEXT_SIZE", "32768")),
                     "stop": ["\n\n\n"]  # Only stop on triple newlines
                 }
