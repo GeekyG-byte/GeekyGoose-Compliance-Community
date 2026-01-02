@@ -22,7 +22,7 @@ from middleware import (
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from database import get_db
-from models import Document, Org, User, Framework, Control, Requirement, EvidenceLink, Scan, ScanResult, Gap, DocumentControlLink, DocumentPage
+from models import Document, Org, User, Framework, Control, Requirement, EvidenceLink, Scan, ScanResult, Gap, DocumentControlLink, DocumentPage, Settings
 from storage import storage
 from worker_tasks import extract_document_text, process_scan
 from pydantic import BaseModel
@@ -416,24 +416,15 @@ def _extract_json_from_response(response_text):
     return None
 
 def _safe_json_loads(json_data, default=None):
-    """Safely parse JSON data, returning default value if parsing fails."""
+    """Safely parse JSON data from JSONB columns, which are already parsed by PostgreSQL."""
     if json_data is None:
         return default
-    
-    # If it's already a Python object (list, dict), return it directly
-    if isinstance(json_data, (list, dict)):
-        return json_data
-    
-    # If it's a string, try to parse as JSON
-    if isinstance(json_data, str):
-        if not json_data.strip():
-            return default
-        try:
-            return json.loads(json_data)
-        except json.JSONDecodeError as e:
-            logger.warning(f"Invalid JSON string in database - returning default. Content: {json_data[:100]}... Error: {e}")
-            return default
-    
+
+    # JSONB columns return already-parsed Python objects (str, list, dict)
+    # Just return them directly - no JSON parsing needed
+    if isinstance(json_data, (str, list, dict)):
+        return json_data if json_data else default
+
     # For any other type, log and return default
     logger.warning(f"Unexpected data type in database - returning default. Type: {type(json_data)}, Content: {str(json_data)[:100]}...")
     return default
@@ -1503,18 +1494,26 @@ async def upload_document(
         db.add(document)
         db.commit()
         db.refresh(document)
-        
+
+        # Trigger text extraction task (required for compliance scanning)
+        try:
+            from worker_tasks import extract_document_text
+            extract_task = extract_document_text.delay(str(document.id))
+            logger.info(f"Triggered text extraction task for {file.filename}: {extract_task.id}")
+        except Exception as e:
+            logger.error(f"Failed to trigger text extraction for {file.filename}: {e}")
+
         # Return immediate response without AI analysis to prevent timeouts
         # AI analysis will be processed in background
         suggested_controls = []
-        
+
         # Start background AI analysis (but don't wait for it)
         import asyncio
         try:
             # Schedule AI analysis in background
             asyncio.create_task(process_document_ai_analysis_background(
-                document.id, 
-                file.filename, 
+                document.id,
+                file.filename,
                 file_content
             ))
             logger.info(f"Scheduled background AI analysis for {file.filename}")
@@ -2008,15 +2007,40 @@ async def link_evidence_to_control(
 
 @app.get("/controls/{control_id}/evidence")
 async def get_control_evidence(control_id: str, db: Session = Depends(get_db)):
-    """Get all evidence linked to a control."""
-    
-    # Get all evidence links for the control
-    evidence_links = db.query(EvidenceLink).filter(
+    """Get all evidence linked to a control (both AI-linked and manual)."""
+
+    result = []
+
+    # Get AI-linked evidence (DocumentControlLink)
+    ai_links = db.query(DocumentControlLink).filter(
+        DocumentControlLink.control_id == control_id
+    ).all()
+
+    for link in ai_links:
+        result.append({
+            "id": str(link.id),
+            "document": {
+                "id": str(link.document.id),
+                "filename": link.document.filename,
+                "mime_type": link.document.mime_type,
+                "file_size": link.document.file_size,
+                "created_at": link.document.created_at.isoformat(),
+                "download_url": storage.get_download_url(link.document.storage_key)
+            },
+            "requirement": None,  # AI links are control-level, not requirement-level
+            "note": "",
+            "created_at": link.created_at.isoformat(),
+            "confidence": link.confidence,
+            "reasoning": link.reasoning,
+            "is_ai_linked": True
+        })
+
+    # Get manually linked evidence (EvidenceLink)
+    manual_links = db.query(EvidenceLink).filter(
         EvidenceLink.control_id == control_id
     ).all()
-    
-    result = []
-    for link in evidence_links:
+
+    for link in manual_links:
         result.append({
             "id": str(link.id),
             "document": {
@@ -2033,9 +2057,12 @@ async def get_control_evidence(control_id: str, db: Session = Depends(get_db)):
                 "text": link.requirement.text
             } if link.requirement else None,
             "note": link.note,
-            "created_at": link.created_at.isoformat()
+            "created_at": link.created_at.isoformat(),
+            "confidence": None,
+            "reasoning": None,
+            "is_ai_linked": False
         })
-    
+
     return {"evidence": result}
 
 @app.get("/controls/{control_id}/documents")
@@ -2095,15 +2122,21 @@ async def create_scan(
     if not org:
         raise HTTPException(status_code=400, detail="No organization found")
     
-    # Check if there's evidence linked to this control
-    evidence_count = db.query(EvidenceLink).filter(
+    # Check if there's evidence linked to this control (manual OR AI-linked)
+    manual_evidence_count = db.query(EvidenceLink).filter(
         EvidenceLink.control_id == control_id,
         EvidenceLink.org_id == org.id
     ).count()
-    
-    if evidence_count == 0:
+
+    ai_evidence_count = db.query(DocumentControlLink).filter(
+        DocumentControlLink.control_id == control_id
+    ).count()
+
+    total_evidence = manual_evidence_count + ai_evidence_count
+
+    if total_evidence == 0:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail="No evidence linked to this control. Please upload and link evidence documents first."
         )
     
@@ -2212,43 +2245,74 @@ class AISettingsRequest(BaseModel):
     ollama_context_size: Optional[int] = 32768
 
 @app.get("/settings/ai")
-async def get_ai_settings():
-    """Get current AI provider settings."""
+async def get_ai_settings(db: Session = Depends(get_db)):
+    """Get current AI provider settings from database."""
+    # Get or create settings record
+    settings = db.query(Settings).filter(Settings.id == 1).first()
+
+    if not settings:
+        # Create default settings if none exist
+        settings = Settings(
+            id=1,
+            ai_provider=os.getenv("AI_PROVIDER", "ollama"),
+            openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            openai_endpoint=os.getenv("OPENAI_ENDPOINT"),
+            ollama_endpoint=os.getenv("OLLAMA_ENDPOINT", "http://host.docker.internal:11434"),
+            ollama_model=os.getenv("OLLAMA_MODEL", "qwen2.5:14b"),
+            ollama_context_size=int(os.getenv("OLLAMA_CONTEXT_SIZE", "131072"))
+        )
+        # Set API key from env if available
+        if os.getenv("OPENAI_API_KEY"):
+            settings.openai_api_key = os.getenv("OPENAI_API_KEY")
+
+        db.add(settings)
+        db.commit()
+        db.refresh(settings)
+
     return {
-        "provider": os.getenv("AI_PROVIDER", "openai"),
-        "openai_model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        "openai_endpoint": os.getenv("OPENAI_ENDPOINT"),
-        "ollama_endpoint": os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434"),
-        "ollama_model": os.getenv("OLLAMA_MODEL", "llama2"),
-        "ollama_context_size": int(os.getenv("OLLAMA_CONTEXT_SIZE", "32768")),
+        "provider": settings.ai_provider,
+        "openai_model": settings.openai_model,
+        "openai_endpoint": settings.openai_endpoint,
+        "ollama_endpoint": settings.ollama_endpoint,
+        "ollama_model": settings.ollama_model,
+        "ollama_context_size": settings.ollama_context_size,
         # Don't return API key for security
-        "openai_api_key": "***" if os.getenv("OPENAI_API_KEY") else None
+        "openai_api_key": "***" if settings.openai_api_key else None
     }
 
 @app.post("/settings/ai")
-async def save_ai_settings(settings: AISettingsRequest):
-    """Save AI provider settings."""
-    # In a production app, you'd save these to a database or config file
-    # For now, we'll update environment variables for this session
-    os.environ["AI_PROVIDER"] = settings.provider
-    
-    if settings.provider == "openai":
-        if settings.openai_api_key and settings.openai_api_key != "***":
-            os.environ["OPENAI_API_KEY"] = settings.openai_api_key
-        if settings.openai_model:
-            os.environ["OPENAI_MODEL"] = settings.openai_model
-        if settings.openai_endpoint:
-            os.environ["OPENAI_ENDPOINT"] = settings.openai_endpoint
-        elif "OPENAI_ENDPOINT" in os.environ:
-            # Clear custom endpoint if not specified
-            del os.environ["OPENAI_ENDPOINT"]
-    elif settings.provider == "ollama":
-        if settings.ollama_endpoint:
-            os.environ["OLLAMA_ENDPOINT"] = settings.ollama_endpoint
-        if settings.ollama_model:
-            os.environ["OLLAMA_MODEL"] = settings.ollama_model
-        if settings.ollama_context_size is not None:
-            os.environ["OLLAMA_CONTEXT_SIZE"] = str(settings.ollama_context_size)
+async def save_ai_settings(settings_request: AISettingsRequest, db: Session = Depends(get_db)):
+    """Save AI provider settings to database."""
+    # Get or create settings record
+    settings = db.query(Settings).filter(Settings.id == 1).first()
+
+    if not settings:
+        settings = Settings(id=1)
+        db.add(settings)
+
+    # Update settings
+    settings.ai_provider = settings_request.provider
+    settings.updated_at = datetime.utcnow()
+
+    if settings_request.provider == "openai":
+        if settings_request.openai_api_key and settings_request.openai_api_key != "***":
+            settings.openai_api_key = settings_request.openai_api_key
+        if settings_request.openai_model:
+            settings.openai_model = settings_request.openai_model
+        if settings_request.openai_endpoint:
+            settings.openai_endpoint = settings_request.openai_endpoint
+        else:
+            settings.openai_endpoint = None
+    elif settings_request.provider == "ollama":
+        if settings_request.ollama_endpoint:
+            settings.ollama_endpoint = settings_request.ollama_endpoint
+        if settings_request.ollama_model:
+            settings.ollama_model = settings_request.ollama_model
+        if settings_request.ollama_context_size is not None:
+            settings.ollama_context_size = settings_request.ollama_context_size
+
+    db.commit()
+    db.refresh(settings)
 
     return {"message": "Settings saved successfully"}
 
@@ -2632,43 +2696,6 @@ async def get_control_details(control_id: str):
             ],
             "created_at": control.created_at.isoformat()
         }
-    finally:
-        db.close()
-
-@app.get("/controls/{control_id}/evidence")
-async def get_control_evidence(control_id: str):
-    """Get evidence linked to a specific control."""
-    db = SessionLocal()
-    try:
-        evidence_links = db.query(EvidenceLink).filter(
-            EvidenceLink.control_id == control_id
-        ).all()
-        
-        evidence = []
-        for link in evidence_links:
-            document = link.document
-            requirement = link.requirement if link.requirement_id else None
-            
-            evidence.append({
-                "id": str(link.id),
-                "document": {
-                    "id": str(document.id),
-                    "filename": document.filename,
-                    "mime_type": document.mime_type,
-                    "file_size": document.file_size,
-                    "created_at": document.created_at.isoformat(),
-                    "download_url": storage.get_download_url(document.storage_key)
-                },
-                "requirement": {
-                    "id": str(requirement.id),
-                    "req_code": requirement.req_code,
-                    "text": requirement.text
-                } if requirement else None,
-                "note": link.note,
-                "created_at": link.created_at.isoformat()
-            })
-        
-        return {"evidence": evidence}
     finally:
         db.close()
 

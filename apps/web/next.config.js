@@ -13,19 +13,16 @@ const nextConfig = {
   env: {
     HOSTNAME: '0.0.0.0',
   },
-  // Configure server timeouts for large file uploads
-  serverRuntimeConfig: {
-    // Increase timeout for API routes
-    maxDuration: 300, // 5 minutes
-  },
   // Configure for development proxy
   devIndicators: {
     buildActivity: false,
   },
-  // New Next.js 16 features
+  // Next.js 16 features
   experimental: {
     // Enable optimizations for better performance
     optimizePackageImports: ['lucide-react', '@radix-ui/react-slot'],
+    // Increase proxy timeout for large file uploads (5 minutes)
+    proxyTimeout: 300000,
   },
 }
 

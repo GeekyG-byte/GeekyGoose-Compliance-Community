@@ -144,6 +144,26 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Settings table (singleton pattern with id=1)
+CREATE TABLE IF NOT EXISTS settings (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    ai_provider VARCHAR(50) DEFAULT 'ollama',
+    openai_api_key VARCHAR(500),
+    openai_model VARCHAR(100) DEFAULT 'gpt-4o-mini',
+    openai_endpoint VARCHAR(500),
+    ollama_endpoint VARCHAR(500) DEFAULT 'http://host.docker.internal:11434',
+    ollama_model VARCHAR(100) DEFAULT 'qwen2.5:14b',
+    ollama_context_size INTEGER DEFAULT 131072,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT single_settings_row CHECK (id = 1)
+);
+
+-- Insert default settings if table is empty
+INSERT INTO settings (id, ai_provider, ollama_endpoint, ollama_model, ollama_context_size)
+VALUES (1, 'ollama', 'http://host.docker.internal:11434', 'qwen2.5:14b', 131072)
+ON CONFLICT (id) DO NOTHING;
+
 -- Indexes for performance (only create if they don't exist)
 CREATE INDEX IF NOT EXISTS idx_users_org_id ON users(org_id);
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
@@ -178,6 +198,7 @@ DROP TRIGGER IF EXISTS update_requirements_updated_at ON requirements;
 DROP TRIGGER IF EXISTS update_documents_updated_at ON documents;
 DROP TRIGGER IF EXISTS update_evidence_links_updated_at ON evidence_links;
 DROP TRIGGER IF EXISTS update_scans_updated_at ON scans;
+DROP TRIGGER IF EXISTS update_settings_updated_at ON settings;
 
 CREATE TRIGGER update_orgs_updated_at BEFORE UPDATE ON orgs FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
@@ -187,3 +208,4 @@ CREATE TRIGGER update_requirements_updated_at BEFORE UPDATE ON requirements FOR 
 CREATE TRIGGER update_documents_updated_at BEFORE UPDATE ON documents FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_evidence_links_updated_at BEFORE UPDATE ON evidence_links FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_scans_updated_at BEFORE UPDATE ON scans FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_settings_updated_at BEFORE UPDATE ON settings FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

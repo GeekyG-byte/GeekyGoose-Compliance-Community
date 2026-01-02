@@ -31,6 +31,7 @@ interface LinkedDocument {
   confidence: number;
   reasoning: string;
   link_created_at: string;
+  is_ai_linked?: boolean;
 }
 
 function LinkedDocuments({ controlId }: { controlId: string }) {
@@ -63,31 +64,73 @@ function LinkedDocuments({ controlId }: { controlId: string }) {
     return <div className="text-xs text-gray-500">No documents linked</div>;
   }
 
+  // Separate AI-linked and manual documents
+  const aiLinked = documents.filter(doc => doc.is_ai_linked !== false);
+  const manualLinked = documents.filter(doc => doc.is_ai_linked === false);
+
   return (
-    <div className="space-y-1">
-      {documents.slice(0, 2).map((doc) => (
-        <div key={doc.id} className="flex items-center justify-between text-xs">
-          <div className="flex items-center space-x-1 flex-1 min-w-0">
-            <span className="text-green-700 truncate" title={doc.filename}>
-              📄 {doc.filename.split('/').pop()}
-            </span>
-            <div className={`w-1.5 h-1.5 rounded-full ${
-              doc.confidence >= 0.8 ? 'bg-green-500' :
-              doc.confidence >= 0.6 ? 'bg-yellow-500' : 'bg-orange-500'
-            }`} title={`Confidence: ${Math.round(doc.confidence * 100)}%`}></div>
+    <div className="space-y-2">
+      {/* AI-Linked Documents */}
+      {aiLinked.length > 0 && (
+        <div>
+          <div className="text-xs font-medium text-blue-700 mb-1">🤖 AI-Linked:</div>
+          <div className="space-y-1">
+            {aiLinked.slice(0, 3).map((doc) => (
+              <div key={doc.id} className="flex items-center justify-between text-xs">
+                <div className="flex items-center space-x-1 flex-1 min-w-0">
+                  <span className="text-blue-700 truncate" title={doc.filename}>
+                    📄 {doc.filename.split('/').pop()}
+                  </span>
+                  <div className={`w-1.5 h-1.5 rounded-full ${
+                    doc.confidence >= 0.7 ? 'bg-green-500' :
+                    doc.confidence >= 0.4 ? 'bg-yellow-500' : 'bg-orange-500'
+                  }`} title={`Confidence: ${Math.round(doc.confidence * 100)}%`}></div>
+                </div>
+                <a
+                  href={doc.download_url}
+                  className="text-blue-600 hover:text-blue-800 ml-1"
+                  title="Download"
+                >
+                  ⬇
+                </a>
+              </div>
+            ))}
+            {aiLinked.length > 3 && (
+              <div className="text-xs text-blue-600">
+                +{aiLinked.length - 3} more
+              </div>
+            )}
           </div>
-          <a
-            href={doc.download_url}
-            className="text-green-600 hover:text-green-800 ml-1"
-            title="Download"
-          >
-            ⬇
-          </a>
         </div>
-      ))}
-      {documents.length > 2 && (
-        <div className="text-xs text-green-600">
-          +{documents.length - 2} more document{documents.length - 2 !== 1 ? 's' : ''}
+      )}
+
+      {/* Manually-Linked Documents */}
+      {manualLinked.length > 0 && (
+        <div>
+          <div className="text-xs font-medium text-purple-700 mb-1">👤 Manual:</div>
+          <div className="space-y-1">
+            {manualLinked.slice(0, 3).map((doc) => (
+              <div key={doc.id} className="flex items-center justify-between text-xs">
+                <div className="flex items-center space-x-1 flex-1 min-w-0">
+                  <span className="text-purple-700 truncate" title={doc.filename}>
+                    📄 {doc.filename.split('/').pop()}
+                  </span>
+                </div>
+                <a
+                  href={doc.download_url}
+                  className="text-purple-600 hover:text-purple-800 ml-1"
+                  title="Download"
+                >
+                  ⬇
+                </a>
+              </div>
+            ))}
+            {manualLinked.length > 3 && (
+              <div className="text-xs text-purple-600">
+                +{manualLinked.length - 3} more
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -99,6 +142,8 @@ export default function ControlsPage() {
   const [controls, setControls] = useState<Control[]>([]);
   const [selectedFramework, setSelectedFramework] = useState<string>('');
   const [loading, setLoading] = useState(false);
+  const [scanningControl, setScanningControl] = useState<string | null>(null);
+  const [scanResults, setScanResults] = useState<{ [key: string]: any }>({});
 
   useEffect(() => {
     fetchFrameworks();
@@ -138,6 +183,109 @@ export default function ControlsPage() {
   const handleFrameworkChange = (frameworkId: string) => {
     setSelectedFramework(frameworkId);
     fetchControls(frameworkId);
+  };
+
+  const runAIScan = async (controlId: string) => {
+    setScanningControl(controlId);
+    try {
+      // Start the scan
+      const response = await fetch(`/api/controls/${controlId}/scan`, {
+        method: 'POST',
+      });
+
+      if (!response.ok) {
+        let errorMessage = 'Scan failed';
+        try {
+          const error = await response.json();
+          errorMessage = error.detail || errorMessage;
+        } catch (e) {
+          errorMessage = `Scan failed with status ${response.status}`;
+        }
+        throw new Error(errorMessage);
+      }
+
+      const data = await response.json();
+      const scanId = data.scan_id;
+
+      if (!scanId) {
+        throw new Error('No scan ID returned from server');
+      }
+
+      // Poll for scan results
+      let attempts = 0;
+      const maxAttempts = 300; // 300 attempts = 5 minutes max (AI scans can take a while)
+
+      const pollResults = async (): Promise<any> => {
+        if (attempts >= maxAttempts) {
+          throw new Error('Scan timeout - AI scan took longer than 5 minutes. Check worker logs for errors.');
+        }
+
+        attempts++;
+
+        try {
+          const statusResponse = await fetch(`/api/scans/${scanId}`);
+
+          if (!statusResponse.ok) {
+            throw new Error(`Failed to fetch scan status (${statusResponse.status})`);
+          }
+
+          const scanData = await statusResponse.json();
+
+          if (scanData.status === 'completed') {
+            return scanData;
+          } else if (scanData.status === 'failed') {
+            throw new Error('Scan failed during processing');
+          } else {
+            // Still processing, wait and try again
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            return pollResults();
+          }
+        } catch (error) {
+          if (attempts < maxAttempts) {
+            // Retry on network errors
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            return pollResults();
+          }
+          throw error;
+        }
+      };
+
+      const scanResults = await pollResults();
+
+      if (!scanResults) {
+        throw new Error('No scan results returned');
+      }
+
+      // Calculate compliance level
+      const results = scanResults.results || [];
+      const passCount = results.filter((r: any) => r.outcome === 'PASS').length;
+      const totalCount = results.length || 1;
+      const overallScore = totalCount > 0 ? passCount / totalCount : 0;
+
+      let complianceLevel = 'NON_COMPLIANT';
+      if (overallScore >= 0.9) complianceLevel = 'COMPLIANT';
+      else if (overallScore >= 0.5) complianceLevel = 'PARTIAL';
+
+      const result = {
+        ...scanResults,
+        compliance_level: complianceLevel,
+        overall_score: overallScore,
+        model: scanResults.model || 'Unknown'
+      };
+
+      setScanResults(prev => ({
+        ...prev,
+        [controlId]: result
+      }));
+
+      alert(`AI Scan completed!\n\nModel: ${result.model}\nCompliance Level: ${complianceLevel}\nOverall Score: ${Math.round(overallScore * 100)}%\n\nPassed: ${passCount}/${totalCount} requirements`);
+    } catch (error: unknown) {
+      console.error('Failed to run AI scan:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Failed to run AI scan. Please try again.';
+      alert(errorMessage);
+    } finally {
+      setScanningControl(null);
+    }
   };
 
   return (
@@ -214,24 +362,76 @@ export default function ControlsPage() {
                   
                   {/* Show linked documents if any */}
                   {control.linked_documents_count > 0 && (
-                    <div className="mb-4 p-2 bg-green-50 rounded border">
-                      <div className="text-xs font-medium text-green-800 mb-1">
-                        🤖 AI-Linked Evidence:
+                    <div className="mb-4 p-2 bg-gray-50 rounded border border-gray-200">
+                      <div className="text-xs font-medium text-gray-800 mb-2">
+                        📎 Linked Evidence:
                       </div>
                       <LinkedDocuments controlId={control.id} />
                     </div>
                   )}
-                  
-                  <div className="flex justify-between items-center">
-                    <Link
-                      href={`/controls/${control.id}`}
-                      className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
-                    >
-                      View Details
-                    </Link>
-                    <span className="text-xs text-gray-500">
-                      {new Date(control.created_at).toLocaleDateString()}
-                    </span>
+
+                  {/* Show scan results if available */}
+                  {scanResults[control.id] && (
+                    <div className="mb-4 p-3 bg-blue-50 rounded border border-blue-200">
+                      <div className="flex justify-between items-start mb-1">
+                        <div className="text-xs font-medium text-blue-900">
+                          🎯 AI Scan Result
+                        </div>
+                        {scanResults[control.id].model && (
+                          <div className="text-xs text-blue-600 bg-blue-100 px-2 py-0.5 rounded">
+                            {scanResults[control.id].model}
+                          </div>
+                        )}
+                      </div>
+                      <div className="text-sm">
+                        <span className={`font-semibold ${
+                          scanResults[control.id].compliance_level === 'COMPLIANT' ? 'text-green-700' :
+                          scanResults[control.id].compliance_level === 'PARTIAL' ? 'text-yellow-700' :
+                          'text-red-700'
+                        }`}>
+                          {scanResults[control.id].compliance_level || 'UNKNOWN'}
+                        </span>
+                        <span className="text-gray-600 ml-2">
+                          ({Math.round((scanResults[control.id].overall_score || 0) * 100)}% confidence)
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex flex-col space-y-2">
+                    <div className="flex justify-between items-center">
+                      <Link
+                        href={`/controls/${control.id}`}
+                        className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+                      >
+                        View Details
+                      </Link>
+                      <span className="text-xs text-gray-500">
+                        {new Date(control.created_at).toLocaleDateString()}
+                      </span>
+                    </div>
+                    {control.linked_documents_count > 0 && (
+                      <button
+                        onClick={() => runAIScan(control.id)}
+                        disabled={scanningControl === control.id}
+                        className={`w-full inline-flex items-center justify-center px-3 py-2 border border-transparent text-sm font-medium rounded-md ${
+                          scanningControl === control.id
+                            ? 'bg-gray-400 cursor-not-allowed text-white'
+                            : 'text-green-700 bg-green-100 hover:bg-green-200'
+                        }`}
+                      >
+                        {scanningControl === control.id ? (
+                          <>
+                            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+                            Running AI Scan...
+                          </>
+                        ) : (
+                          <>
+                            🤖 Run AI Compliance Scan
+                          </>
+                        )}
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>

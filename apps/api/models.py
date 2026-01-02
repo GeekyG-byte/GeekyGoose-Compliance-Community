@@ -203,7 +203,7 @@ class Gap(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
-    
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     org_id = Column(UUID(as_uuid=True), ForeignKey("orgs.id"), nullable=False)
     actor_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
@@ -212,6 +212,20 @@ class AuditLog(Base):
     entity_id = Column(String(100), nullable=False)
     meta_json = Column(Text)  # JSON string
     created_at = Column(DateTime, default=datetime.utcnow)
-    
+
     org = relationship("Org")
     actor = relationship("User")
+
+class Settings(Base):
+    __tablename__ = "settings"
+
+    id = Column(Integer, primary_key=True, default=1)  # Singleton pattern
+    ai_provider = Column(String(50), default='ollama')
+    openai_api_key = Column(String(500))
+    openai_model = Column(String(100), default='gpt-4o-mini')
+    openai_endpoint = Column(String(500))
+    ollama_endpoint = Column(String(500), default='http://host.docker.internal:11434')
+    ollama_model = Column(String(100), default='qwen2.5:14b')
+    ollama_context_size = Column(Integer, default=131072)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

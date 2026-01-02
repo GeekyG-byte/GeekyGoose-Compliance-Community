@@ -6,7 +6,7 @@ import logging
 from typing import List, Dict, Any
 from celery_app import celery_app
 from database import SessionLocal
-from models import Document, DocumentPage, Scan, ScanResult, Gap, Requirement, Control, EvidenceLink
+from models import Document, DocumentPage, Scan, ScanResult, Gap, Requirement, Control, EvidenceLink, DocumentControlLink
 from text_extraction import text_extractor
 from ai_scanner import compliance_scanner
 from storage import storage
@@ -76,10 +76,23 @@ def process_scan(self, scan_id: str):
             raise ValueError(f"Scan {scan_id} not found")
         
         logger.info(f"Starting compliance scan {scan_id} for control {scan.control.code}")
-        
+
+        # Get AI provider and model from settings
+        from models import Settings
+        settings = db.query(Settings).filter(Settings.id == 1).first()
+        if settings:
+            if settings.ai_provider == 'ollama':
+                model_name = f"{settings.ollama_model} (Ollama)"
+            elif settings.ai_provider == 'openai':
+                model_name = settings.openai_model or 'gpt-4o-mini'
+            else:
+                model_name = 'gpt-4'
+        else:
+            model_name = 'gpt-4'
+
         # Update scan status
         scan.status = 'processing'
-        scan.model = 'gpt-4'
+        scan.model = model_name
         scan.prompt_version = 'v1.0'
         db.commit()
         
@@ -87,25 +100,52 @@ def process_scan(self, scan_id: str):
         control = scan.control
         requirements = db.query(Requirement).filter(Requirement.control_id == control.id).all()
         
-        # Get linked evidence documents
-        evidence_links = db.query(EvidenceLink).filter(
+        # Get linked evidence documents (both manual and AI-linked)
+        # Manual evidence links
+        manual_evidence_links = db.query(EvidenceLink).filter(
             EvidenceLink.org_id == scan.org_id,
             EvidenceLink.control_id == control.id
         ).all()
-        
-        if not evidence_links:
+
+        # AI-linked evidence
+        ai_evidence_links = db.query(DocumentControlLink).filter(
+            DocumentControlLink.control_id == control.id
+        ).all()
+
+        total_evidence = len(manual_evidence_links) + len(ai_evidence_links)
+
+        if total_evidence == 0:
             logger.warning(f"No evidence linked to control {control.code} for scan {scan_id}")
             scan.status = 'completed'
             db.commit()
             return {"status": "completed", "message": "No evidence to scan"}
-        
-        # Gather evidence text
+
+        logger.info(f"Found {len(manual_evidence_links)} manual + {len(ai_evidence_links)} AI-linked evidence for control {control.code}")
+
+        # Gather evidence text from both sources
         evidence_texts = []
-        for link in evidence_links:
+
+        # Process manual evidence links
+        for link in manual_evidence_links:
             document_pages = db.query(DocumentPage).filter(
                 DocumentPage.document_id == link.document_id
             ).all()
-            
+
+            for page in document_pages:
+                if page.text:
+                    evidence_texts.append({
+                        "document_id": str(link.document_id),
+                        "document_name": link.document.filename,
+                        "page_num": page.page_num,
+                        "text": page.text
+                    })
+
+        # Process AI-linked evidence
+        for link in ai_evidence_links:
+            document_pages = db.query(DocumentPage).filter(
+                DocumentPage.document_id == link.document_id
+            ).all()
+
             for page in document_pages:
                 if page.text:
                     evidence_texts.append({
@@ -124,18 +164,9 @@ def process_scan(self, scan_id: str):
         
         # Store scan results
         for result in scan_results["requirements"]:
-            # Ensure data is properly serialized to JSON strings
+            # Store raw values - PostgreSQL JSONB will handle JSON encoding
             rationale_json = result.get("rationale", "")
-            if isinstance(rationale_json, (list, dict)):
-                rationale_json = json.dumps(rationale_json)
-            elif not isinstance(rationale_json, str):
-                rationale_json = str(rationale_json)
-            
             citations_json = result.get("citations", [])
-            if isinstance(citations_json, (list, dict)):
-                citations_json = json.dumps(citations_json)
-            elif not isinstance(citations_json, str):
-                citations_json = json.dumps([])
             
             scan_result = ScanResult(
                 scan_id=scan.id,

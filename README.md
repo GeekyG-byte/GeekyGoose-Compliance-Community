@@ -36,11 +36,12 @@
 
 ### 🤖 **AI-Powered Compliance Scanning**
 - **Two-Step Document Analysis**: First scan and summarize, then map to controls
-- **Structured Output Processing**: Reliable AI responses with fallback handling  
+- **Structured Output Processing**: Reliable AI responses with fallback handling
 - **Automated Evidence Analysis**: Upload policies, screenshots, and documents
 - **Smart Gap Detection**: AI identifies what's missing and why
 - **Compliance Scoring**: Pass/Partial/Fail ratings with confidence levels
 - **Citation Tracking**: Direct references to evidence supporting each finding
+- **Model Transparency**: Scan results display which AI model performed the analysis (Ollama/OpenAI)
 
 ### 📊 **Comprehensive Reporting**
 - **Executive Dashboards**: High-level compliance overview with visual metrics
@@ -246,7 +247,7 @@ docker-compose exec api python run_seed.py
 1. **Upload Evidence**: Go to Documents → Upload your policies, screenshots, configs
 2. **Link to Controls**: Navigate to Controls → Select a control → Link your evidence
 3. **Run AI Scan**: Click "Start AI Scan" to analyze evidence against requirements
-4. **Review Results**: See compliance status, gaps, and recommended actions
+4. **Review Results**: See compliance status, gaps, recommended actions, and which AI model performed the scan
 5. **Generate Reports**: Export compliance reports for audits and reviews
 
 ### 📋 **Using Templates**
@@ -710,6 +711,12 @@ curl https://yourdomain.com/health
   - **Format Guidance**: Clear indication of supported file types and size limits
   - **OCR Indicators**: Visual feedback when OCR text extraction is used
   - **File Size Display**: Better formatting of file size information
+
+- **AI Model Transparency**: Scan results now display which model performed the analysis
+  - **Model Badge**: Visual indicator showing AI provider and model name (e.g., "gpt-oss:20b (Ollama)")
+  - **Controls List View**: Model name displayed alongside scan results
+  - **Control Detail View**: Prominent model display in scan result header
+  - **Scan Completion Alert**: Model information included in success notifications
 
 #### 🐛 **Bug Fixes**
 - Fixed document download failures due to incorrect storage method calls

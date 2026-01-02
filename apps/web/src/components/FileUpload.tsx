@@ -139,7 +139,7 @@ export default function FileUpload({ onUploadComplete, enableControlMapping = fa
 
     // Create an AbortController for timeout handling
     const abortController = new AbortController()
-    const timeoutId = setTimeout(() => abortController.abort(), 120000) // 2 minute timeout for large files
+    const timeoutId = setTimeout(() => abortController.abort(), 300000) // 5 minute timeout for large files
 
     try {
       const response = await fetch('/api/documents/upload', {
@@ -156,19 +156,28 @@ export default function FileUpload({ onUploadComplete, enableControlMapping = fa
 
       if (response.ok) {
         const result = await response.json()
-        
+
         // Check if backend provided control suggestions
         if (result.suggested_controls && result.suggested_controls.length > 0) {
           console.log(`Backend provided ${result.suggested_controls.length} control suggestions for ${file.name}`)
-          
+
           // Store the backend suggestions for use after upload
           result._backendSuggestions = result.suggested_controls
         }
 
         return result
       } else {
-        const error = await response.json()
-        throw new Error(error.detail || 'Upload failed')
+        // Try to parse error as JSON, fallback to text if it fails
+        let errorMessage = 'Upload failed'
+        try {
+          const error = await response.json()
+          errorMessage = error.detail || errorMessage
+        } catch {
+          // Response is not JSON (might be HTML error page)
+          const errorText = await response.text()
+          errorMessage = errorText || `Upload failed with status ${response.status}`
+        }
+        throw new Error(errorMessage)
       }
     } catch (error: any) {
       clearTimeout(timeoutId)

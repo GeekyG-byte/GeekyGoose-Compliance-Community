@@ -8,7 +8,8 @@ import os
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
 from pydantic import BaseModel, Field
-from models import Control, Requirement
+from models import Control, Requirement, Settings
+from database import SessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -39,44 +40,69 @@ def create_chat_completion_safe(client, model, messages, temperature=None):
 client = None
 
 def get_ai_client():
-    """Get AI client based on configured provider."""
-    provider = os.getenv('AI_PROVIDER', 'openai')
-    
-    if provider == 'openai':
-        api_key = os.getenv('OPENAI_API_KEY')
-        base_url = os.getenv('OPENAI_ENDPOINT')
-        
-        # Only require API key if using default OpenAI endpoint
-        if (not api_key or api_key == 'your_openai_api_key_here') and not base_url:
-            raise ValueError("OPENAI_API_KEY not configured. Please set a valid OpenAI API key for default OpenAI endpoint.")
-        
-        # Use placeholder key for custom endpoints that don't require authentication
-        if (not api_key or api_key == 'your_openai_api_key_here') and base_url:
-            api_key = LOCAL_AI_PLACEHOLDER_KEY
-        
-        try:
-            from openai import OpenAI
-            return OpenAI(api_key=api_key, base_url=base_url)
-        except Exception as e:
-            logger.error(f"Failed to initialize OpenAI client: {e}")
-            raise
-    elif provider == 'ollama':
-        try:
-            import requests
-            endpoint = os.getenv('OLLAMA_ENDPOINT', 'http://localhost:11434')
-            model = os.getenv('OLLAMA_MODEL', 'llama2')
-            
-            # Test connection
-            response = requests.get(f"{endpoint}/api/tags", timeout=5)
-            if response.status_code != 200:
-                raise ValueError(f"Cannot connect to Ollama at {endpoint}")
-                
-            return {'endpoint': endpoint, 'model': model, 'type': 'ollama'}
-        except Exception as e:
-            logger.error(f"Failed to initialize Ollama client: {e}")
-            raise
-    else:
-        raise ValueError(f"Unknown AI provider: {provider}")
+    """Get AI client based on configured provider from database."""
+    db = SessionLocal()
+    try:
+        # Get settings from database
+        settings = db.query(Settings).filter(Settings.id == 1).first()
+
+        # Fall back to environment variables if database settings don't exist
+        if not settings:
+            logger.warning("No settings found in database, using environment variables")
+            provider = os.getenv('AI_PROVIDER', 'ollama')
+        else:
+            provider = settings.ai_provider
+
+        if provider == 'openai':
+            # Get settings from database or fallback to environment
+            if settings:
+                api_key = settings.openai_api_key
+                base_url = settings.openai_endpoint
+            else:
+                api_key = os.getenv('OPENAI_API_KEY')
+                base_url = os.getenv('OPENAI_ENDPOINT')
+
+            # Only require API key if using default OpenAI endpoint
+            if (not api_key or api_key == 'your_openai_api_key_here') and not base_url:
+                raise ValueError("OPENAI_API_KEY not configured. Please set a valid OpenAI API key for default OpenAI endpoint.")
+
+            # Use placeholder key for custom endpoints that don't require authentication
+            if (not api_key or api_key == 'your_openai_api_key_here') and base_url:
+                api_key = LOCAL_AI_PLACEHOLDER_KEY
+
+            try:
+                from openai import OpenAI
+                return OpenAI(api_key=api_key, base_url=base_url)
+            except Exception as e:
+                logger.error(f"Failed to initialize OpenAI client: {e}")
+                raise
+        elif provider == 'ollama':
+            try:
+                import requests
+
+                # Get settings from database or fallback to environment
+                if settings:
+                    endpoint = settings.ollama_endpoint or 'http://host.docker.internal:11434'
+                    model = settings.ollama_model or 'qwen2.5:14b'
+                else:
+                    endpoint = os.getenv('OLLAMA_ENDPOINT', 'http://host.docker.internal:11434')
+                    model = os.getenv('OLLAMA_MODEL', 'qwen2.5:14b')
+
+                logger.info(f"Connecting to Ollama at {endpoint} with model {model}")
+
+                # Test connection
+                response = requests.get(f"{endpoint}/api/tags", timeout=5)
+                if response.status_code != 200:
+                    raise ValueError(f"Cannot connect to Ollama at {endpoint}")
+
+                return {'endpoint': endpoint, 'model': model, 'type': 'ollama'}
+            except Exception as e:
+                logger.error(f"Failed to initialize Ollama client: {e}")
+                raise
+        else:
+            raise ValueError(f"Unknown AI provider: {provider}")
+    finally:
+        db.close()
 
 def get_openai_client():
     """Legacy function for backward compatibility."""
@@ -319,9 +345,17 @@ You must respond with valid JSON only, following this exact schema:
         """Call Ollama API and parse response."""
         import requests
         import json
-        
+
         endpoint = client_config['endpoint']
         model = client_config['model']
+
+        # Get context size from database settings
+        db = SessionLocal()
+        try:
+            settings = db.query(Settings).filter(Settings.id == 1).first()
+            context_size = settings.ollama_context_size if settings else 131072
+        finally:
+            db.close()
         
         # Add JSON schema instruction to prompt
         json_prompt = prompt + """
@@ -358,10 +392,10 @@ Respond only with valid JSON. No additional text."""
                     "options": {
                         "temperature": 0.1,
                         "top_p": 0.9,
-                        "num_ctx": int(os.getenv("OLLAMA_CONTEXT_SIZE", "32768"))  # Configurable context window
+                        "num_ctx": context_size  # Use context size from database settings
                     }
                 },
-                timeout=45  # Reduced timeout to prevent connection drops
+                timeout=300  # 5 minutes timeout for large models
             )
             
             if response.status_code != 200:

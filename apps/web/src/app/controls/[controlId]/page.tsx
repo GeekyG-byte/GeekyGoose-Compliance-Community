@@ -40,6 +40,9 @@ interface Evidence {
   } | null;
   note: string;
   created_at: string;
+  confidence?: number;
+  reasoning?: string;
+  is_ai_linked?: boolean;
 }
 
 interface ScanResult {
@@ -370,28 +373,99 @@ export default function ControlDetailPage() {
                     <p className="text-sm text-gray-400">Upload documents and return here to link them as evidence.</p>
                   </div>
                 ) : (
-                  <div className="space-y-3">
-                    {evidence.map((item) => (
-                      <div key={item.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
-                        <div className="flex-1">
-                          <h4 className="font-medium text-gray-900">{item.document.filename}</h4>
-                          <p className="text-sm text-gray-600">
-                            {item.requirement ? `Linked to: ${item.requirement.req_code}` : 'General evidence'}
-                          </p>
-                          <p className="text-xs text-gray-500 mt-1">
-                            {(item.document.file_size / 1024).toFixed(1)} KB • {item.document.mime_type}
-                          </p>
+                  <div className="space-y-4">
+                    {/* AI-Linked Evidence */}
+                    {evidence.filter(item => item.is_ai_linked !== false).length > 0 && (
+                      <div>
+                        <h3 className="text-sm font-semibold text-blue-700 mb-3 flex items-center">
+                          🤖 AI-Linked Evidence
+                          <span className="ml-2 bg-blue-100 text-blue-700 text-xs px-2 py-0.5 rounded-full">
+                            {evidence.filter(item => item.is_ai_linked !== false).length}
+                          </span>
+                        </h3>
+                        <div className="space-y-2">
+                          {evidence.filter(item => item.is_ai_linked !== false).map((item) => (
+                            <div key={item.id} className="flex items-start justify-between p-3 bg-blue-50 rounded-lg border border-blue-200">
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2 mb-1">
+                                  <h4 className="font-medium text-gray-900 truncate">{item.document.filename}</h4>
+                                  {item.confidence !== undefined && (
+                                    <div className="flex items-center gap-1">
+                                      <div className={`w-2 h-2 rounded-full ${
+                                        item.confidence >= 0.7 ? 'bg-green-500' :
+                                        item.confidence >= 0.4 ? 'bg-yellow-500' : 'bg-orange-500'
+                                      }`} title={`Confidence: ${Math.round(item.confidence * 100)}%`}></div>
+                                      <span className="text-xs text-gray-600">
+                                        {Math.round(item.confidence * 100)}%
+                                      </span>
+                                    </div>
+                                  )}
+                                </div>
+                                <p className="text-sm text-gray-600">
+                                  {item.requirement ? `Linked to: ${item.requirement.req_code}` : 'General evidence'}
+                                </p>
+                                {item.reasoning && (
+                                  <p className="text-xs text-gray-500 mt-1 italic">
+                                    "{item.reasoning.substring(0, 100)}{item.reasoning.length > 100 ? '...' : ''}"
+                                  </p>
+                                )}
+                                <p className="text-xs text-gray-500 mt-1">
+                                  {(item.document.file_size / 1024).toFixed(1)} KB • {item.document.mime_type}
+                                </p>
+                              </div>
+                              <a
+                                href={item.document.download_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="ml-3 flex-shrink-0 text-blue-600 hover:text-blue-700 font-medium"
+                              >
+                                View
+                              </a>
+                            </div>
+                          ))}
                         </div>
-                        <a
-                          href={item.document.download_url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="ml-4 text-blue-600 hover:text-blue-700"
-                        >
-                          View
-                        </a>
                       </div>
-                    ))}
+                    )}
+
+                    {/* Manually-Linked Evidence */}
+                    {evidence.filter(item => item.is_ai_linked === false).length > 0 && (
+                      <div>
+                        <h3 className="text-sm font-semibold text-purple-700 mb-3 flex items-center">
+                          👤 Manually-Linked Evidence
+                          <span className="ml-2 bg-purple-100 text-purple-700 text-xs px-2 py-0.5 rounded-full">
+                            {evidence.filter(item => item.is_ai_linked === false).length}
+                          </span>
+                        </h3>
+                        <div className="space-y-2">
+                          {evidence.filter(item => item.is_ai_linked === false).map((item) => (
+                            <div key={item.id} className="flex items-start justify-between p-3 bg-purple-50 rounded-lg border border-purple-200">
+                              <div className="flex-1 min-w-0">
+                                <h4 className="font-medium text-gray-900 truncate mb-1">{item.document.filename}</h4>
+                                <p className="text-sm text-gray-600">
+                                  {item.requirement ? `Linked to: ${item.requirement.req_code}` : 'General evidence'}
+                                </p>
+                                {item.note && item.note !== 'Linked from control page' && (
+                                  <p className="text-xs text-gray-500 mt-1 italic">
+                                    Note: {item.note}
+                                  </p>
+                                )}
+                                <p className="text-xs text-gray-500 mt-1">
+                                  {(item.document.file_size / 1024).toFixed(1)} KB • {item.document.mime_type}
+                                </p>
+                              </div>
+                              <a
+                                href={item.document.download_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="ml-3 flex-shrink-0 text-purple-600 hover:text-purple-700 font-medium"
+                              >
+                                View
+                              </a>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -415,9 +489,13 @@ export default function ControlDetailPage() {
                       {latestScan.status}
                     </span>
                   </div>
-                  <p className="text-sm text-gray-600 mt-1">
-                    {new Date(latestScan.created_at).toLocaleString()} • {latestScan.model}
-                  </p>
+                  <div className="flex items-center gap-4 mt-2 text-sm text-gray-600">
+                    <span>{new Date(latestScan.created_at).toLocaleString()}</span>
+                    <span className="flex items-center gap-1 px-2 py-1 bg-blue-50 text-blue-700 rounded">
+                      <span>🤖</span>
+                      <span className="font-medium">{latestScan.model}</span>
+                    </span>
+                  </div>
                 </div>
                 <div className="p-6">
                   {latestScan.status === 'completed' && latestScan.results.length > 0 ? (
