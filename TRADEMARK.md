@@ -150,8 +150,8 @@ We may update this trademark policy from time to time. Changes will be posted to
 
 If you have questions about this trademark policy or are unsure whether your use case is acceptable, please contact us:
 
-**Email**: legal@geekygoose.io
-**General Contact**: info@geekygoose.io
+**Email**: admin@geekygoose.io
+**General Contact**: admin@geekygoose.io
 
 We're here to help and want to support the community while protecting the project's identity.
 
