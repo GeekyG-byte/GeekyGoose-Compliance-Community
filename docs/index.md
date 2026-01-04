@@ -84,6 +84,7 @@ title: Home
       <p>Run it locally in minutes with Docker Compose.</p>
     </div>
   </div>
+  
 <div markdown="1">
 ```bash
 git clone https://github.com/q7technology/GeekyGoose-Compliance-Community.git
@@ -97,8 +98,7 @@ docker-compose exec api python run_seed.py
 
 # Open the web app
 # http://localhost:3000
-```
-</div>
+```</div>
 
   <div class="callout">
     <strong>Tip:</strong>
