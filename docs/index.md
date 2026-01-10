@@ -52,7 +52,7 @@ title: Home
   <div class="section-title">
     <div>
       <h2>What you get</h2>
-      <p>UpGuard‑style clarity: simple sections, clean cards, and a single story from “scan” → “gap” → “report”.</p>
+      <p>Clarity: simple sections, clean cards, and a single story from “scan” → “gap” → “report”.</p>
     </div>
   </div>
 
@@ -84,7 +84,8 @@ title: Home
       <p>Run it locally in minutes with Docker Compose.</p>
     </div>
   </div>
-
+  
+<div markdown="1">
 ```bash
 git clone https://github.com/q7technology/GeekyGoose-Compliance-Community.git
 cd GeekyGoose-Compliance-Community
@@ -97,7 +98,7 @@ docker-compose exec api python run_seed.py
 
 # Open the web app
 # http://localhost:3000
-```
+```</div>
 
   <div class="callout">
     <strong>Tip:</strong>

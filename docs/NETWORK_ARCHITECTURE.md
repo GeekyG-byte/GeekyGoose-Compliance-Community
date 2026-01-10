@@ -205,4 +205,4 @@ Since the web frontend is accessible on your LAN, you can:
 
 ---
 
-For more information, see the main [README.md](../README.md) or contact support.
+For more information, see the main [README.md](https://github.com/q7technology/GeekyGoose-Compliance-Community) or contact support.
