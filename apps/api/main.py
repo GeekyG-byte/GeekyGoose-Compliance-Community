@@ -2452,28 +2452,27 @@ async def save_ai_settings(settings_request: AISettingsRequest, db: Session = De
 
     # Update dual vision validation setting
     if settings_request.use_dual_vision_validation is not None:
-        settings.use_dual_vision_validation = 1 if settings_request.use_dual_vision_validation else 0
+        settings.use_dual_vision_validation = bool(settings_request.use_dual_vision_validation)
 
-    if settings_request.provider == "openai":
-        if settings_request.openai_api_key and settings_request.openai_api_key != "***":
-            settings.openai_api_key = settings_request.openai_api_key
-        if settings_request.openai_model:
-            settings.openai_model = settings_request.openai_model
-        if settings_request.openai_vision_model:
-            settings.openai_vision_model = settings_request.openai_vision_model
-        if settings_request.openai_endpoint:
-            settings.openai_endpoint = settings_request.openai_endpoint
-        else:
-            settings.openai_endpoint = None
-    elif settings_request.provider == "ollama":
-        if settings_request.ollama_endpoint:
-            settings.ollama_endpoint = settings_request.ollama_endpoint
-        if settings_request.ollama_model:
-            settings.ollama_model = settings_request.ollama_model
-        if settings_request.ollama_vision_model:
-            settings.ollama_vision_model = settings_request.ollama_vision_model
-        if settings_request.ollama_context_size is not None:
-            settings.ollama_context_size = settings_request.ollama_context_size
+    # Update OpenAI settings (allow even when provider is Ollama, for dual validation)
+    if settings_request.openai_api_key and settings_request.openai_api_key != "***":
+        settings.openai_api_key = settings_request.openai_api_key
+    if settings_request.openai_model:
+        settings.openai_model = settings_request.openai_model
+    if settings_request.openai_vision_model:
+        settings.openai_vision_model = settings_request.openai_vision_model
+    if settings_request.openai_endpoint is not None:
+        settings.openai_endpoint = settings_request.openai_endpoint if settings_request.openai_endpoint else None
+
+    # Update Ollama settings (allow even when provider is OpenAI, for dual validation)
+    if settings_request.ollama_endpoint:
+        settings.ollama_endpoint = settings_request.ollama_endpoint
+    if settings_request.ollama_model:
+        settings.ollama_model = settings_request.ollama_model
+    if settings_request.ollama_vision_model:
+        settings.ollama_vision_model = settings_request.ollama_vision_model
+    if settings_request.ollama_context_size is not None:
+        settings.ollama_context_size = settings_request.ollama_context_size
 
     db.commit()
     db.refresh(settings)
