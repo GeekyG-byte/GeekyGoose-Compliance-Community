@@ -125,7 +125,8 @@ class RequestValidationMiddleware(BaseHTTPMiddleware):
         # Check request size
         content_length = request.headers.get("content-length")
         if content_length and int(content_length) > self.MAX_REQUEST_SIZE:
-            logger.warning(f"Request size too large: {content_length} bytes from {request.client.host}")
+            client_host = request.client.host if request.client else "unknown"
+            logger.warning(f"Request size too large: {content_length} bytes from {client_host}")
             return JSONResponse(
                 status_code=413,
                 content={

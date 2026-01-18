@@ -48,3 +48,7 @@ certifi>=2024.8.30 # Updated certificate bundle
 python-magic==0.4.27  # For better file type detection
 chardet==5.2.0  # Character encoding detection
 python-dateutil==2.9.0.post0  # Date parsing utilities
+
+# Type stubs for mypy
+types-Markdown>=3.5.0  # Type stubs for markdown library
+types-requests>=2.31.0  # Type stubs for requests library

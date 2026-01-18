@@ -1,11 +1,13 @@
 import uuid
 from sqlalchemy import Column, String, DateTime, Integer, Text, BigInteger, ForeignKey, Float, Index
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, DeclarativeBase
 from datetime import datetime
 
-Base = declarative_base()
+
+class Base(DeclarativeBase):
+    """SQLAlchemy 2.0 style declarative base class."""
+    pass
 
 class Org(Base):
     __tablename__ = "orgs"

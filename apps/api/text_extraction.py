@@ -5,7 +5,7 @@ Supports PDF, DOCX, TXT, and images with OCR.
 import io
 import os
 import logging
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 from pathlib import Path
 import fitz  # PyMuPDF
 import pdfplumber
@@ -25,7 +25,7 @@ class TextExtractor:
         # pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
         pass
     
-    def extract_text(self, file_content: bytes, filename: str, mime_type: str) -> List[Dict[str, any]]:
+    def extract_text(self, file_content: bytes, filename: str, mime_type: str) -> List[Dict[str, Any]]:
         """
         Extract text from a file and return list of pages with text content.
         
@@ -53,7 +53,7 @@ class TextExtractor:
             logger.error(f"Error extracting text from {filename}: {str(e)}")
             return []
     
-    def _extract_pdf_text(self, file_content: bytes) -> List[Dict[str, any]]:
+    def _extract_pdf_text(self, file_content: bytes) -> List[Dict[str, Any]]:
         """Extract text from PDF using both PyMuPDF and pdfplumber for best results."""
         pages = []
         
@@ -94,7 +94,7 @@ class TextExtractor:
         
         return pages
     
-    def _extract_docx_text(self, file_content: bytes) -> List[Dict[str, any]]:
+    def _extract_docx_text(self, file_content: bytes) -> List[Dict[str, Any]]:
         """Extract text from DOCX file."""
         try:
             doc = DocxDocument(io.BytesIO(file_content))
@@ -122,7 +122,7 @@ class TextExtractor:
             logger.error(f"Error extracting DOCX text: {e}")
             return []
     
-    def _extract_txt_text(self, file_content: bytes) -> List[Dict[str, any]]:
+    def _extract_txt_text(self, file_content: bytes) -> List[Dict[str, Any]]:
         """Extract text from plain text file."""
         try:
             # Try UTF-8 first, fallback to latin-1
@@ -140,7 +140,7 @@ class TextExtractor:
             logger.error(f"Error extracting TXT text: {e}")
             return []
     
-    def _extract_image_text(self, file_content: bytes) -> List[Dict[str, any]]:
+    def _extract_image_text(self, file_content: bytes) -> List[Dict[str, Any]]:
         """Extract text from image using OCR."""
         try:
             # Open image with PIL
@@ -163,7 +163,7 @@ class TextExtractor:
             return []
     
     def extract_and_chunk_text(self, file_content: bytes, filename: str, mime_type: str, 
-                              chunk_size: int = 1000, overlap: int = 200) -> List[Dict[str, any]]:
+                              chunk_size: int = 1000, overlap: int = 200) -> List[Dict[str, Any]]:
         """
         Extract text and split into chunks for embedding/retrieval.
         

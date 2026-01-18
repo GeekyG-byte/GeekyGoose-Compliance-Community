@@ -279,7 +279,7 @@ class ComplianceScanner:
                     scan_result = ScanResponse(requirements=[], gaps=[])
             
             # Convert to dictionary format expected by worker
-            result_dict = {
+            result_dict: Dict[str, List[Any]] = {
                 "requirements": [],
                 "gaps": []
             }
@@ -485,15 +485,15 @@ Respond only with valid JSON. No additional text."""
                 logger.warning(f"Failed to parse Ollama JSON response: {response_text[:200]}...")
                 return ScanResponse(
                     requirements=[],
-                    gaps=[{
-                        "requirement_id": "unknown",
-                        "summary": "Failed to parse AI response - please try again",
-                        "recommended_actions": [{
-                            "title": "Retry Analysis",
-                            "detail": "The AI response could not be parsed. Try running the scan again.",
-                            "priority": "MEDIUM"
-                        }]
-                    }]
+                    gaps=[Gap(
+                        requirement_id="unknown",
+                        summary="Failed to parse AI response - please try again",
+                        recommended_actions=[RecommendedAction(
+                            title="Retry Analysis",
+                            detail="The AI response could not be parsed. Try running the scan again.",
+                            priority="MEDIUM"
+                        )]
+                    )]
                 )
                 
         except Exception as e:

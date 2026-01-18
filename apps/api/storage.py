@@ -1,7 +1,7 @@
 import os
 import hashlib
 import uuid
-from typing import BinaryIO
+from typing import BinaryIO, Optional
 import boto3
 from botocore.client import Config
 
@@ -28,7 +28,7 @@ class MinIOStorage:
         except:
             self.client.create_bucket(Bucket=self.bucket)
     
-    def upload_file(self, file: BinaryIO, filename: str, mime_type: str = None) -> tuple[str, str, int]:
+    def upload_file(self, file: BinaryIO, filename: str, mime_type: Optional[str] = None) -> tuple[str, str, int]:
         """Upload file and return (storage_key, sha256_hash, file_size)"""
         # Read file content
         file_content = file.read()

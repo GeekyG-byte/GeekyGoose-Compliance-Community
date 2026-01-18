@@ -6,7 +6,7 @@ import requests
 import logging
 import asyncio
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Any, Dict, cast
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, BackgroundTasks, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -526,7 +526,8 @@ async def analyze_file_content_for_controls(file: UploadFile, file_content: byte
         
         # Extract content based on file type with enhanced detection
         file_text = ""
-        filename = file.filename.split('\\')[-1].split('/')[-1]  # Clean filename
+        raw_filename = file.filename or "unknown"
+        filename = raw_filename.split('\\')[-1].split('/')[-1]  # Clean filename
         
         # Use python-magic for better file type detection
         try:
@@ -542,7 +543,7 @@ async def analyze_file_content_for_controls(file: UploadFile, file_content: byte
                 import chardet
                 # Detect encoding for better text extraction
                 detected = chardet.detect(file_content)
-                encoding = detected.get('encoding', 'utf-8')
+                encoding = detected.get('encoding') or 'utf-8'
                 file_text = file_content.decode(encoding, errors='ignore')[:2000]  # Limit to first 2000 chars
             except Exception as e:
                 try:
@@ -584,7 +585,7 @@ async def analyze_file_content_for_controls(file: UploadFile, file_content: byte
                 logger.warning(f"PDF extraction failed for {filename}: {e}")
                 file_text = f"PDF document: {filename} (text extraction failed)"
                 
-        elif (file_mime and file_mime.startswith("image/")) or file.content_type.startswith("image/") or filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+        elif (file_mime and file_mime.startswith("image/")) or (file.content_type and file.content_type.startswith("image/")) or filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
             # Enhanced image processing with OCR fallback
             try:
                 from ai_scanner import get_ai_client
@@ -1431,8 +1432,8 @@ def extract_suggestions_from_text(text_response: str, available_controls: list) 
     
     return suggestions
 
-def generate_fallback_suggestions_from_filename(filename: str, available_controls: list) -> list:
-    """Generate basic suggestions based on filename when AI analysis completely fails."""
+def generate_essential_eight_suggestions_from_filename(filename: str, available_controls: list) -> list:
+    """Generate Essential Eight specific suggestions based on filename patterns."""
     suggestions = []
     filename_lower = filename.lower()
     
@@ -1614,10 +1615,11 @@ async def upload_document(
                 for control in controls
             ]
             
-            suggested_controls = generate_fallback_suggestions_from_filename(file.filename, available_controls)[:1]
-            logger.info(f"Providing immediate filename-based suggestions for {file.filename}: {len(suggested_controls)} suggestions")
+            upload_filename = file.filename or "unknown"
+            suggested_controls = generate_fallback_suggestions_from_filename(upload_filename, available_controls)[:1]
+            logger.info(f"Providing immediate filename-based suggestions for {upload_filename}: {len(suggested_controls)} suggestions")
         except Exception as e:
-            logger.error(f"Filename-based suggestions failed for {file.filename}: {e}")
+            logger.error(f"Filename-based suggestions failed for {file.filename or 'unknown'}: {e}")
             suggested_controls = []
         
         return {
@@ -2644,7 +2646,7 @@ async def get_demo_ollama_models():
     }
 
 @app.get("/settings/openai/models")
-async def get_openai_models(endpoint: str = None, api_key: str = None):
+async def get_openai_models(endpoint: Optional[str] = None, api_key: Optional[str] = None):
     """Get list of available models from OpenAI or custom OpenAI-compatible endpoint."""
     try:
         from openai import OpenAI
@@ -2826,74 +2828,6 @@ def get_model_family(model_name: str) -> str:
         return 'Qwen'
     else:
         return 'Other'
-
-# Additional API endpoints for control details and reporting
-
-@app.get("/controls/{control_id}")
-async def get_control_details(control_id: str):
-    """Get detailed information about a specific control including requirements."""
-    db = SessionLocal()
-    try:
-        control = get_control_by_id_or_code(db, control_id)
-        if not control:
-            raise HTTPException(status_code=404, detail="Control not found")
-        
-        requirements = db.query(Requirement).filter(Requirement.control_id == control.id).all()
-        
-        return {
-            "id": str(control.id),
-            "framework_id": str(control.framework_id),
-            "framework_name": control.framework.name,
-            "code": control.code,
-            "title": control.title,
-            "description": control.description,
-            "requirements": [
-                {
-                    "id": str(req.id),
-                    "req_code": req.req_code,
-                    "text": req.text,
-                    "maturity_level": req.maturity_level,
-                    "guidance": req.guidance
-                }
-                for req in requirements
-            ],
-            "created_at": control.created_at.isoformat()
-        }
-    finally:
-        db.close()
-
-@app.get("/controls/{control_id}/scans")
-async def get_control_scans(control_id: str):
-    """Get all scans for a specific control."""
-    db = SessionLocal()
-    try:
-        # Find the control by ID or code
-        control = get_control_by_id_or_code(db, control_id)
-        if not control:
-            raise HTTPException(status_code=404, detail="Control not found")
-
-        scans = db.query(Scan).filter(
-            Scan.control_id == control.id
-        ).order_by(Scan.created_at.desc()).all()
-        
-        scan_list = []
-        for scan in scans:
-            scan_list.append({
-                "id": str(scan.id),
-                "status": scan.status,
-                "model": scan.model,
-                "prompt_version": scan.prompt_version,
-                "progress_percentage": scan.progress_percentage or 0,
-                "current_step": scan.current_step or 'Initializing...',
-                "total_requirements": scan.total_requirements or 0,
-                "processed_requirements": scan.processed_requirements or 0,
-                "created_at": scan.created_at.isoformat(),
-                "updated_at": scan.updated_at.isoformat()
-            })
-        
-        return {"scans": scan_list}
-    finally:
-        db.close()
 
 # AI-powered document analysis endpoints
 class ControlAnalysisRequest(BaseModel):
@@ -3259,7 +3193,7 @@ Do not include any text before or after the JSON. Do not use markdown formatting
 @app.post("/analyze-document-controls")
 async def analyze_document_controls(
     file: UploadFile = File(...),
-    available_controls: str = None
+    available_controls: Optional[str] = None
 ):
     """Analyze uploaded document and suggest relevant compliance controls."""
     try:
@@ -3292,7 +3226,7 @@ async def analyze_document_controls(
                 logger.warning(f"PDF text extraction failed: {e}")
                 file_text = f"PDF document: {file.filename} (text extraction failed)"
         
-        elif file.content_type.startswith("image/"):
+        elif file.content_type and file.content_type.startswith("image/"):
             # Analyze image using AI vision
             try:
                 import base64
