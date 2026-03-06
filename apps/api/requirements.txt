@@ -31,7 +31,7 @@ Pillow==11.0.0  # Latest Pillow for image processing
 pytesseract==0.3.13  # Latest pytesseract for OCR
 
 # Additional document processing libraries
-markdown==3.7  # For markdown document processing
+markdown==3.8.1  # For markdown document processing
 beautifulsoup4==4.12.3  # For HTML content extraction
 
 # HTTP and networking
