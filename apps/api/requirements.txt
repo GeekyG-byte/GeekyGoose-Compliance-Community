@@ -1,7 +1,7 @@
 # Core FastAPI and web framework
 fastapi>=0.115.0
 uvicorn[standard]==0.32.0
-python-multipart>=0.0.20           # >=0.0.20 required for CVE-2024-47761 path-traversal and DoS fixes
+python-multipart>=0.0.27           # >=0.0.27 required for CVE-2026-42561 (DoS), CVE-2026-24486 (arbitrary file write), CVE-2026-40347 (DoS)
 
 # Database and ORM
 sqlalchemy==2.0.36
@@ -27,26 +27,26 @@ pdfplumber==0.11.4  # Latest pdfplumber for advanced PDF parsing
 python-docx==1.1.2  # Latest python-docx for Word documents
 
 # Image processing and OCR - Latest versions
-Pillow>=11.1.0  # >=11.1.0 required for CVE-2024-28219 and related image processing vulns
+Pillow>=12.2.0  # >=12.2.0 required for CVE-2026-25990/42311 (OOB write), CVE-2026-40192 (decompression bomb), CVE-2026-42310/42308
 pytesseract==0.3.13  # Latest pytesseract for OCR
 
 # Additional document processing libraries
-markdown==3.7  # For markdown document processing
+markdown>=3.8.1  # >=3.8.1 required for CVE-2025-69534 (DoS via uncaught exception)
 beautifulsoup4==4.12.3  # For HTML content extraction
 
 # HTTP and networking
-requests==2.32.4
+requests>=2.33.0  # >=2.33.0 required for CVE-2026-25645 (insecure temp file reuse)
 
 # Authentication and encryption
 # python-jose is abandoned (CVE-2022-29217, CVE-2024-33663) — replaced by PyJWT
-PyJWT>=2.9.0                      # JWT token signing/verification
+PyJWT>=2.12.0                     # >=2.12.0 required for CVE-2026-32597 (crit header bypass)
 passlib[bcrypt]==1.7.4            # Password hashing
 bcrypt==3.2.2                     # Pin below 4.x; passlib 1.7.4 is incompatible with bcrypt 4+ (removed __about__, strict 72-byte limit breaks passlib's internal wrap-bug detection)
-cryptography>=44.0.0              # Fernet symmetric encryption; >=44.0.0 required for CVE-2024-26130, CVE-2024-12797
+cryptography>=46.0.6              # >=46.0.6 required for CVE-2026-26007 (subgroup attack), CVE-2024-12797, CVE-2026-34073
 
 # Security updates - Pinned by Snyk
 h11==0.16.0 # not directly required, pinned by Snyk to avoid a vulnerability
-urllib3>=2.6.0 # not directly required, pinned by Snyk to avoid a vulnerability
+urllib3>=2.7.0 # >=2.7.0 required for CVE-2026-21441/44432 (decompression bombs), CVE-2026-44431 (header leakage)
 anyio>=4.4.0 # not directly required, pinned by Snyk to avoid a vulnerability
 zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
 certifi>=2024.8.30 # Updated certificate bundle
