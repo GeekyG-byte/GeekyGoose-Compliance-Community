@@ -1,7 +1,7 @@
 # Core FastAPI and web framework
 fastapi>=0.115.0
 uvicorn[standard]==0.32.0
-python-multipart==0.0.18
+python-multipart>=0.0.20           # >=0.0.20 required for CVE-2024-47761 path-traversal and DoS fixes
 
 # Database and ORM
 sqlalchemy==2.0.36
@@ -27,7 +27,7 @@ pdfplumber==0.11.4  # Latest pdfplumber for advanced PDF parsing
 python-docx==1.1.2  # Latest python-docx for Word documents
 
 # Image processing and OCR - Latest versions
-Pillow==11.0.0  # Latest Pillow for image processing
+Pillow>=11.1.0  # >=11.1.0 required for CVE-2024-28219 and related image processing vulns
 pytesseract==0.3.13  # Latest pytesseract for OCR
 
 # Additional document processing libraries
@@ -38,10 +38,11 @@ beautifulsoup4==4.12.3  # For HTML content extraction
 requests==2.32.4
 
 # Authentication and encryption
-python-jose[cryptography]==3.3.0  # JWT token signing/verification
+# python-jose is abandoned (CVE-2022-29217, CVE-2024-33663) — replaced by PyJWT
+PyJWT>=2.9.0                      # JWT token signing/verification
 passlib[bcrypt]==1.7.4            # Password hashing
 bcrypt==3.2.2                     # Pin below 4.x; passlib 1.7.4 is incompatible with bcrypt 4+ (removed __about__, strict 72-byte limit breaks passlib's internal wrap-bug detection)
-cryptography>=42.0.0              # Fernet symmetric encryption for secrets at rest
+cryptography>=44.0.0              # Fernet symmetric encryption; >=44.0.0 required for CVE-2024-26130, CVE-2024-12797
 
 # Security updates - Pinned by Snyk
 h11==0.16.0 # not directly required, pinned by Snyk to avoid a vulnerability
