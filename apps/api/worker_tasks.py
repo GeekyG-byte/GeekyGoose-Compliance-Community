@@ -241,11 +241,10 @@ def process_scan(self, scan_id: str):
         
     except Exception as e:
         logger.error(f"Error processing scan {scan_id}: {str(e)}")
-        # Update scan status to failed
+        db.rollback()
         scan.status = 'failed'
         scan.current_step = f'Error: {str(e)[:100]}'
         db.commit()
-        db.rollback()
         raise self.retry(exc=e, countdown=60, max_retries=3)
     finally:
         db.close()

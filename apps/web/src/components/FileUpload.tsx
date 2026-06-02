@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, DragEvent, ChangeEvent } from 'react'
+import { authFetch } from '../utils/api'
 
 interface UploadedFile {
   id: string
@@ -101,7 +102,7 @@ export default function FileUpload({ onUploadComplete }: { onUploadComplete?: ()
     const timeoutId = setTimeout(() => abortController.abort(), 300000) // 5 minute timeout for large files
 
     try {
-      const response = await fetch('/api/documents/upload', {
+      const response = await authFetch('/api/documents/upload', {
         method: 'POST',
         body: formData,
         signal: abortController.signal,
@@ -189,7 +190,7 @@ export default function FileUpload({ onUploadComplete }: { onUploadComplete?: ()
     // Poll this specific file until completion
     const pollInterval = setInterval(async () => {
       try {
-        const response = await fetch(`/api/documents/${file.id}/ai-status`)
+        const response = await authFetch(`/api/documents/${file.id}/ai-status`)
         if (response.ok) {
           const data = await response.json()
           if (data.ai_processed) {

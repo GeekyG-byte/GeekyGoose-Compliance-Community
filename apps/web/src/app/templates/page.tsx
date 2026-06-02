@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { essentialEightTemplates, EssentialEightTemplate as EssentialEightTemplateData } from '../../data/essential-eight-templates';
+import { authFetch } from '../../utils/api';
 
 interface Framework {
   id: string;
@@ -115,7 +116,7 @@ export default function TemplatesPage() {
       const controlsAI: { [key: string]: any } = {};
       try {
         // Try to fetch Essential Eight framework controls
-        const frameworksResponse = await fetch('/api/frameworks');
+        const frameworksResponse = await authFetch('/api/frameworks');
         if (frameworksResponse.ok) {
           const frameworksData = await frameworksResponse.json();
           const essentialEightFramework = frameworksData.frameworks?.find(
@@ -123,7 +124,7 @@ export default function TemplatesPage() {
           );
 
           if (essentialEightFramework) {
-            const controlsResponse = await fetch(`/api/frameworks/${essentialEightFramework.id}/controls`);
+            const controlsResponse = await authFetch(`/api/frameworks/${essentialEightFramework.id}/controls`);
             if (controlsResponse.ok) {
               const controlsData = await controlsResponse.json();
 
@@ -134,7 +135,7 @@ export default function TemplatesPage() {
 
                 // Fetch scan data for this control
                 try {
-                  const scansResponse = await fetch(`/api/controls/${control.id}/scans`);
+                  const scansResponse = await authFetch(`/api/controls/${control.id}/scans`);
                   if (scansResponse.ok) {
                     const scansData = await scansResponse.json();
                     const latestScan = scansData.scans?.[0]; // Get most recent scan
@@ -227,7 +228,7 @@ export default function TemplatesPage() {
 
   const fetchFrameworks = async () => {
     try {
-      const response = await fetch('/api/frameworks');
+      const response = await authFetch('/api/frameworks');
       if (response.ok) {
         const data = await response.json();
         setFrameworks(data.frameworks);
@@ -243,7 +244,7 @@ export default function TemplatesPage() {
 
   const fetchControls = async (frameworkId: string) => {
     try {
-      const response = await fetch(`/api/frameworks/${frameworkId}/controls`);
+      const response = await authFetch(`/api/frameworks/${frameworkId}/controls`);
       if (response.ok) {
         const data = await response.json();
         setControls(data.controls);

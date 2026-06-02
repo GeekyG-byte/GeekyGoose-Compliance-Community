@@ -8,8 +8,8 @@ from botocore.client import Config
 class MinIOStorage:
     def __init__(self):
         self.endpoint = os.getenv("MINIO_ENDPOINT", "minio:9000")
-        self.access_key = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-        self.secret_key = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
+        self.access_key = os.environ["MINIO_ACCESS_KEY"]
+        self.secret_key = os.environ["MINIO_SECRET_KEY"]
         self.bucket = os.getenv("MINIO_BUCKET", "geekygoose-docs")
         self.use_ssl = os.getenv("MINIO_USE_SSL", "false").lower() == "true"
         

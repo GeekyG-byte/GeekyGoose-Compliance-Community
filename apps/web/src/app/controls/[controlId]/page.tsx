@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
+import { authFetch } from '../../../utils/api';
 
 interface Requirement {
   id: string;
@@ -121,7 +122,7 @@ export default function ControlDetailPage() {
 
   const fetchControlDetails = async () => {
     try {
-      const response = await fetch(`/api/controls/${controlId}`);
+      const response = await authFetch(`/api/controls/${controlId}`);
       if (response.ok) {
         const data = await response.json();
         setControl(data);
@@ -133,7 +134,7 @@ export default function ControlDetailPage() {
 
   const fetchEvidence = async () => {
     try {
-      const response = await fetch(`/api/controls/${controlId}/evidence`);
+      const response = await authFetch(`/api/controls/${controlId}/evidence`);
       if (response.ok) {
         const data = await response.json();
         setEvidence(data.evidence);
@@ -145,13 +146,13 @@ export default function ControlDetailPage() {
 
   const fetchScans = async () => {
     try {
-      const response = await fetch(`/api/controls/${controlId}/scans`);
+      const response = await authFetch(`/api/controls/${controlId}/scans`);
       if (response.ok) {
         const data = await response.json();
         setScans(data.scans);
         if (data.scans.length > 0) {
           // Fetch latest scan details
-          const latestScanResponse = await fetch(`/api/scans/${data.scans[0].id}`);
+          const latestScanResponse = await authFetch(`/api/scans/${data.scans[0].id}`);
           if (latestScanResponse.ok) {
             const latestScanData = await latestScanResponse.json();
             setLatestScan(latestScanData);
@@ -165,7 +166,7 @@ export default function ControlDetailPage() {
 
   const fetchAvailableDocuments = async () => {
     try {
-      const response = await fetch('/api/documents');
+      const response = await authFetch('/api/documents');
       if (response.ok) {
         const data = await response.json();
         setAvailableDocuments(data.documents);
@@ -178,7 +179,7 @@ export default function ControlDetailPage() {
   const startScan = async () => {
     setScanLoading(true);
     try {
-      const response = await fetch(`/api/controls/${controlId}/scan`, {
+      const response = await authFetch(`/api/controls/${controlId}/scan`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -230,7 +231,7 @@ export default function ControlDetailPage() {
     setLinkingEvidence(documentId);
     setLinkingInProgress(documentId);
     try {
-      const response = await fetch(`/api/documents/${documentId}/link-evidence`, {
+      const response = await authFetch(`/api/documents/${documentId}/link-evidence`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

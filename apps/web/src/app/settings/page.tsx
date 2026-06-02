@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import { authFetch } from '../../utils/api';
 import Link from 'next/link';
 
 interface AISettings {
@@ -76,7 +77,7 @@ export default function SettingsPage() {
 
   const fetchSettings = async () => {
     try {
-      const response = await fetch('/api/settings/ai');
+      const response = await authFetch('/api/settings/ai');
       if (response.ok) {
         const data = await response.json();
         setSettings({ ...settings, ...data });
@@ -109,7 +110,7 @@ export default function SettingsPage() {
         queryParams.append('api_key', targetApiKey);
       }
 
-      const response = await fetch(`/api/settings/openai/models?${queryParams}`);
+      const response = await authFetch(`/api/settings/openai/models?${queryParams}`);
       
       if (response.ok) {
         const data = await response.json();
@@ -133,7 +134,7 @@ export default function SettingsPage() {
     setFetchingModels(true);
     try {
       const targetEndpoint = endpoint || settings.ollama_endpoint || 'http://172.16.0.11:11434';
-      const response = await fetch(`/api/settings/ollama/models?endpoint=${encodeURIComponent(targetEndpoint)}`);
+      const response = await authFetch(`/api/settings/ollama/models?endpoint=${encodeURIComponent(targetEndpoint)}`);
       
       if (response.ok) {
         const data = await response.json();
@@ -156,7 +157,7 @@ export default function SettingsPage() {
   const saveSettings = async () => {
     setSaving(true);
     try {
-      const response = await fetch('/api/settings/ai', {
+      const response = await authFetch('/api/settings/ai', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -183,7 +184,7 @@ export default function SettingsPage() {
     setTestResult(null);
     
     try {
-      const response = await fetch('/api/settings/ai/test', {
+      const response = await authFetch('/api/settings/ai/test', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

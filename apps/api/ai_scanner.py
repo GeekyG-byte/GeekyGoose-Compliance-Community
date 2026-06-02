@@ -10,8 +10,22 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 from models import Control, Requirement, Settings
 from database import SessionLocal
+from crypto import decrypt_secret, is_encrypted
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_api_key(raw_key: Optional[str]) -> Optional[str]:
+    """Decrypt the stored API key if it was encrypted with Fernet."""
+    if not raw_key:
+        return raw_key
+    if is_encrypted(raw_key):
+        try:
+            return decrypt_secret(raw_key)
+        except Exception as e:
+            logger.error(f"Failed to decrypt stored API key: {e}")
+            return None
+    return raw_key
 
 # NOT A SECRET: This is a placeholder key for local AI endpoints (Ollama, LM Studio, etc.)
 # that don't require authentication. It has no security value and is never used with real APIs.
@@ -54,7 +68,8 @@ def get_vision_clients_for_dual_validation():
         clients = {}
 
         # Check if OpenAI is properly configured (has valid API key)
-        openai_configured = bool(settings.openai_api_key and settings.openai_api_key != 'your_openai_api_key_here')
+        resolved_key = _resolve_api_key(settings.openai_api_key)
+        openai_configured = bool(resolved_key and resolved_key != 'your_openai_api_key_here')
 
         # Check if Ollama is properly configured
         ollama_configured = bool(settings.ollama_endpoint)
@@ -74,7 +89,7 @@ def get_vision_clients_for_dual_validation():
             from openai import OpenAI
             clients['openai'] = {
                 'client': OpenAI(
-                    api_key=settings.openai_api_key,
+                    api_key=_resolve_api_key(settings.openai_api_key),
                     base_url=settings.openai_endpoint
                 ),
                 'model': settings.openai_vision_model or 'gpt-4o',
@@ -128,7 +143,7 @@ def get_ai_client():
         if provider == 'openai':
             # Get settings from database or fallback to environment
             if settings:
-                api_key = settings.openai_api_key
+                api_key = _resolve_api_key(settings.openai_api_key)
                 base_url = settings.openai_endpoint
             else:
                 api_key = os.getenv('OPENAI_API_KEY')

@@ -37,6 +37,12 @@ beautifulsoup4==4.12.3  # For HTML content extraction
 # HTTP and networking
 requests==2.32.4
 
+# Authentication and encryption
+python-jose[cryptography]==3.3.0  # JWT token signing/verification
+passlib[bcrypt]==1.7.4            # Password hashing
+bcrypt==3.2.2                     # Pin below 4.x; passlib 1.7.4 is incompatible with bcrypt 4+ (removed __about__, strict 72-byte limit breaks passlib's internal wrap-bug detection)
+cryptography>=42.0.0              # Fernet symmetric encryption for secrets at rest
+
 # Security updates - Pinned by Snyk
 h11==0.16.0 # not directly required, pinned by Snyk to avoid a vulnerability
 urllib3>=2.6.0 # not directly required, pinned by Snyk to avoid a vulnerability

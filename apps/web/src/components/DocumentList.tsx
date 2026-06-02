@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect } from 'react'
+import { authFetch } from '../utils/api'
 
 interface Document {
   id: string
@@ -59,7 +60,7 @@ export default function DocumentList({ refreshTrigger }: { refreshTrigger?: numb
   const fetchDocuments = async () => {
     try {
       setIsLoading(true)
-      const response = await fetch('/api/documents')
+      const response = await authFetch('/api/documents')
       
       if (response.ok) {
         const data = await response.json()
@@ -81,7 +82,7 @@ export default function DocumentList({ refreshTrigger }: { refreshTrigger?: numb
     }
 
     try {
-      const response = await fetch(`/api/documents/${documentId}`, {
+      const response = await authFetch(`/api/documents/${documentId}`, {
         method: 'DELETE',
       })
 
@@ -177,7 +178,7 @@ export default function DocumentList({ refreshTrigger }: { refreshTrigger?: numb
   const retryProcessing = async (doc: Document) => {
     try {
       // Trigger a new processing attempt by calling the analyze endpoint
-      const response = await fetch('/api/analyze-documents', {
+      const response = await authFetch('/api/analyze-documents', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -205,7 +206,7 @@ export default function DocumentList({ refreshTrigger }: { refreshTrigger?: numb
     // Fetch frameworks if not already loaded
     if (frameworks.length === 0) {
       try {
-        const response = await fetch('/api/frameworks')
+        const response = await authFetch('/api/frameworks')
         if (response.ok) {
           const data = await response.json()
           setFrameworks(data.frameworks)
@@ -224,7 +225,7 @@ export default function DocumentList({ refreshTrigger }: { refreshTrigger?: numb
 
   const fetchControls = async (frameworkId: string) => {
     try {
-      const response = await fetch(`/api/frameworks/${frameworkId}/controls`)
+      const response = await authFetch(`/api/frameworks/${frameworkId}/controls`)
       if (response.ok) {
         const data = await response.json()
         setControls(data.controls)
@@ -254,7 +255,7 @@ export default function DocumentList({ refreshTrigger }: { refreshTrigger?: numb
     try {
       // Link each selected control to the document via the API
       for (const controlId of selectedControls) {
-        const response = await fetch(`/api/documents/${selectedDocument.id}/link-evidence`, {
+        const response = await authFetch(`/api/documents/${selectedDocument.id}/link-evidence`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

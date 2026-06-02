@@ -25,14 +25,21 @@ interface Template {
   }>;
 }
 
+const escapeHtml = (s: string): string =>
+  s.replace(/&/g, '&amp;')
+   .replace(/</g, '&lt;')
+   .replace(/>/g, '&gt;')
+   .replace(/"/g, '&quot;')
+   .replace(/'/g, '&#39;');
+
 export const generatePolicyDocument = (template: Template, companyName?: string) => {
-  const today = new Date().toLocaleDateString('en-US', { 
-    year: 'numeric', 
-    month: 'long', 
-    day: 'numeric' 
+  const today = new Date().toLocaleDateString('en-US', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric'
   });
 
-  const companyNameToUse = companyName || '[COMPANY NAME]';
+  const companyNameToUse = escapeHtml(companyName || '[COMPANY NAME]');
   
   const policyContent = `
 <!DOCTYPE html>
@@ -303,14 +310,14 @@ export const generatePolicyDocument = (template: Template, companyName?: string)
 };
 
 export const downloadTemplateAsWord = (template: Template, companyName?: string, companyData?: Record<string, any>) => {
-  const today = new Date().toLocaleDateString('en-US', { 
-    year: 'numeric', 
+  const today = new Date().toLocaleDateString('en-US', {
+    year: 'numeric',
     month: 'long', 
     day: 'numeric' 
   });
 
-  const companyNameToUse = companyName || '[COMPANY NAME]';
-  
+  const companyNameToUse = escapeHtml(companyName || '[COMPANY NAME]');
+
   // Generate Word document content using HTML format that Word can import
   const wordContent = `
 <html xmlns:o="urn:schemas-microsoft-com:office:office"

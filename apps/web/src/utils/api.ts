@@ -27,18 +27,38 @@ export class APIError extends Error {
  * @param retries - Number of retry attempts
  * @returns Promise with response data
  */
+function getAuthHeaders(): Record<string, string> {
+  const token =
+    typeof window !== 'undefined' ? localStorage.getItem('gg_token') : null;
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/**
+ * Drop-in replacement for fetch() that automatically attaches the Bearer token.
+ */
+export function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
+  return fetch(url, {
+    ...options,
+    headers: {
+      ...getAuthHeaders(),
+      ...options.headers,
+    },
+  });
+}
+
 export async function apiRequest<T = any>(
-  url: string, 
+  url: string,
   options: RequestInit = {},
   retries: number = 3
 ): Promise<T> {
   const fullUrl = url.startsWith('http') ? url : `${API_BASE_URL}${url}`;
-  
+
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const response = await fetch(fullUrl, {
         headers: {
           'Content-Type': 'application/json',
+          ...getAuthHeaders(),
           ...options.headers,
         },
         ...options,
@@ -169,6 +189,9 @@ export function uploadFile<T = any>(
     
     const fullUrl = url.startsWith('http') ? url : `${API_BASE_URL}${url}`;
     xhr.open('POST', fullUrl);
+    const token =
+      typeof window !== 'undefined' ? localStorage.getItem('gg_token') : null;
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
     xhr.send(formData);
   });
 }

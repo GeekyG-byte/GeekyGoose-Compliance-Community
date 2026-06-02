@@ -4,6 +4,7 @@ import React, { useState, useEffect } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { downloadTemplateAsWord } from '../../../../utils/policyGenerator';
+import { authFetch } from '../../../../utils/api';
 
 interface Template {
   id: string;
@@ -114,7 +115,7 @@ export default function FillTemplatePage() {
           // Fetch linked documents from the control
           if (foundTemplate.control?.id) {
             try {
-              const response = await fetch(`/api/controls/${foundTemplate.control.id}/documents`);
+              const response = await authFetch(`/api/controls/${foundTemplate.control.id}/documents`);
               if (response.ok) {
                 const data = await response.json();
                 setLinkedDocuments(data.documents || []);
@@ -313,7 +314,7 @@ export default function FillTemplatePage() {
       }
 
       // Call backend AI validation API
-      const response = await fetch('/api/validate-evidence', {
+      const response = await authFetch('/api/validate-evidence', {
         method: 'POST',
         body: formData,
       });

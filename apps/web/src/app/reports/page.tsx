@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
+import { authFetch } from '../../utils/api';
 
 interface Requirement {
   id: string;
@@ -88,7 +89,7 @@ export default function ReportsPage() {
 
   const fetchFrameworks = async () => {
     try {
-      const response = await fetch('/api/frameworks');
+      const response = await authFetch('/api/frameworks');
       if (response.ok) {
         const data = await response.json();
         setFrameworks(data.frameworks);
@@ -104,7 +105,7 @@ export default function ReportsPage() {
   const fetchControlsWithScans = async (frameworkId: string) => {
     try {
       setLoading(true);
-      const controlsResponse = await fetch(`/api/frameworks/${frameworkId}/controls`);
+      const controlsResponse = await authFetch(`/api/frameworks/${frameworkId}/controls`);
       
       if (controlsResponse.ok) {
         const controlsData = await controlsResponse.json();
@@ -113,14 +114,14 @@ export default function ReportsPage() {
         const controlsWithScans = await Promise.all(
           controlsData.controls.map(async (control: Control) => {
             try {
-              const scansResponse = await fetch(`/api/controls/${control.id}/scans`);
+              const scansResponse = await authFetch(`/api/controls/${control.id}/scans`);
               if (scansResponse.ok) {
                 const scansData = await scansResponse.json();
                 if (scansData.scans.length > 0) {
                   // Get the latest completed scan
                   const latestScan = scansData.scans.find((scan: any) => scan.status === 'completed');
                   if (latestScan) {
-                    const scanDetailResponse = await fetch(`/api/scans/${latestScan.id}`);
+                    const scanDetailResponse = await authFetch(`/api/scans/${latestScan.id}`);
                     if (scanDetailResponse.ok) {
                       const scanDetail = await scanDetailResponse.json();
                       control.latest_scan = scanDetail;
@@ -147,7 +148,7 @@ export default function ReportsPage() {
   const fetchDocumentsWithAI = async () => {
     try {
       setDocumentsLoading(true);
-      const response = await fetch('/api/documents');
+      const response = await authFetch('/api/documents');
       if (response.ok) {
         const data = await response.json();
         // Filter documents that have AI processing (have control links)
@@ -166,7 +167,7 @@ export default function ReportsPage() {
   const runComprehensiveAIAnalysis = async () => {
     try {
       setDocumentsLoading(true);
-      const response = await fetch('/api/reports/comprehensive-analysis', {
+      const response = await authFetch('/api/reports/comprehensive-analysis', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

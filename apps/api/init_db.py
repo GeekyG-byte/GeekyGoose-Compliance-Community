@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from database import engine, SessionLocal
 from models import Base, Framework
 from seed_data import seed_essential_eight
+from seed_financial_frameworks import seed_all_financial_frameworks
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,12 @@ def run_initial_seed():
         logger.info("Seeding Essential Eight framework...")
         framework_id = seed_essential_eight(db)
         logger.info(f"Essential Eight framework seeded successfully with ID: {framework_id}")
-        
+
+        # Seed financial frameworks
+        logger.info("Seeding financial compliance frameworks...")
+        seeded = seed_all_financial_frameworks(db)
+        logger.info(f"Financial frameworks seeded: {seeded}")
+
         db.close()
         return True
         
@@ -104,7 +110,15 @@ def initialize_database():
             logger.error("Failed to seed initial data")
             return False
     else:
-        logger.info("Database already contains data, skipping seed")
+        logger.info("Database already contains data, checking for missing financial frameworks...")
+        try:
+            db = SessionLocal()
+            seeded = seed_all_financial_frameworks(db)
+            if seeded:
+                logger.info(f"Added missing financial frameworks: {seeded}")
+            db.close()
+        except Exception as e:
+            logger.error(f"Error seeding financial frameworks: {e}")
     
     logger.info("Database initialization completed successfully")
     return True

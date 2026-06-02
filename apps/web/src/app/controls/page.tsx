@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
+import { authFetch } from '../../utils/api';
 
 interface Framework {
   id: string;
@@ -41,7 +42,7 @@ function LinkedDocuments({ controlId }: { controlId: string }) {
 
   const fetchDocuments = async () => {
     try {
-      const response = await fetch(`/api/controls/${controlId}/documents`);
+      const response = await authFetch(`/api/controls/${controlId}/documents`);
       if (response.ok) {
         const data = await response.json();
         setDocuments(data.documents);
@@ -59,7 +60,7 @@ function LinkedDocuments({ controlId }: { controlId: string }) {
     }
 
     try {
-      const response = await fetch(`/api/document-control-links/${linkId}`, {
+      const response = await authFetch(`/api/document-control-links/${linkId}`, {
         method: 'DELETE',
       });
 
@@ -206,7 +207,7 @@ export default function ControlsPage() {
 
   const fetchFrameworks = async () => {
     try {
-      const response = await fetch('/api/frameworks');
+      const response = await authFetch('/api/frameworks');
       if (response.ok) {
         const data = await response.json();
         setFrameworks(data.frameworks);
@@ -223,7 +224,7 @@ export default function ControlsPage() {
   const fetchControls = async (frameworkId: string) => {
     setLoading(true);
     try {
-      const response = await fetch(`/api/frameworks/${frameworkId}/controls`);
+      const response = await authFetch(`/api/frameworks/${frameworkId}/controls`);
       if (response.ok) {
         const data = await response.json();
         setControls(data.controls);
@@ -247,7 +248,7 @@ export default function ControlsPage() {
 
     try {
       // Start the scan
-      const response = await fetch(`/api/controls/${controlId}/scan`, {
+      const response = await authFetch(`/api/controls/${controlId}/scan`, {
         method: 'POST',
       });
 
@@ -312,7 +313,7 @@ export default function ControlsPage() {
       attempts++;
 
       try {
-        const statusResponse = await fetch(`/api/scans/${scanId}`);
+        const statusResponse = await authFetch(`/api/scans/${scanId}`);
 
         if (!statusResponse.ok) {
           throw new Error(`Failed to fetch scan status (${statusResponse.status})`);

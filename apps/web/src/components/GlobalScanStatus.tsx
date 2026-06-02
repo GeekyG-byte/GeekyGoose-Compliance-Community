@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
+import { authFetch } from '../utils/api';
 
 interface RunningScan {
   id: string;
@@ -35,7 +36,7 @@ export default function GlobalScanStatus() {
           const updatedScans: RunningScan[] = [];
           for (const scan of scans) {
             try {
-              const response = await fetch(`/api/scans/${scan.id}`);
+              const response = await authFetch(`/api/scans/${scan.id}`);
               if (response.ok) {
                 const data = await response.json();
                 if (data.status === 'running' || data.status === 'pending' || data.status === 'processing') {

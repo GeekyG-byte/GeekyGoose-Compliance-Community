@@ -5,10 +5,11 @@ import json as json_module
 import requests
 import logging
 import asyncio
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import List, Optional, Any, Dict, cast
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, BackgroundTasks, Form
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, BackgroundTasks, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from middleware import (
     ErrorHandlingMiddleware, 
@@ -27,6 +28,8 @@ from storage import storage
 from worker_tasks import extract_document_text, process_scan
 from pydantic import BaseModel
 from init_db import initialize_database
+from auth import get_current_user, require_admin, verify_password, get_password_hash, create_access_token
+from crypto import encrypt_secret, decrypt_secret, is_encrypted
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -113,20 +116,24 @@ Return JSON summary:
         
         # Step 2: Control Mapping using the JSON from Step 1
         controls_json = []
-        for i, control in enumerate(available_controls[:20], 1):
+        for i, control in enumerate(available_controls[:50], 1):
             controls_json.append({
                 "number": i,
                 "code": control['code'],
                 "title": control['title'],
                 "framework": control.get('framework', 'Unknown')
             })
-        
+
         mapping_prompt = f"""Document Summary: {json_module.dumps(document_summary_json, indent=2)}
 
 Available Controls: {json_module.dumps(controls_json, indent=2)}
 
-Return control mapping JSON:
-{{"selected_control_number":1,"confidence":0.90,"reasoning":"Brief match explanation"}}"""
+Identify ALL controls from ANY framework that this document provides evidence for.
+Return up to 10 matches as a JSON array, ordered by confidence (highest first).
+Only include controls with genuine relevance (confidence >= 0.5).
+
+Return JSON only:
+{{"selected_controls":[{{"number":1,"confidence":0.90,"reasoning":"Brief match explanation"}},{{"number":4,"confidence":0.75,"reasoning":"Brief match explanation"}}]}}"""
         
         logger.info(f"Step 2: JSON mapping controls for {filename}")
         
@@ -185,26 +192,23 @@ Return control mapping JSON:
 def _convert_json_mapping_to_suggestions(mapping_json: dict, available_controls: List[dict], controls_json: List[dict]) -> List[dict]:
     """Convert JSON mapping result to the expected suggestions format"""
     try:
-        selected_number = mapping_json.get('selected_control_number', 1)
-        confidence = mapping_json.get('confidence', 0.5)
-        reasoning = mapping_json.get('reasoning', 'AI analysis')
-        
-        # Validate the selected control number
-        if 1 <= selected_number <= len(controls_json):
-            control_index = selected_number - 1  # Convert to 0-indexed
-            if control_index < len(available_controls):
-                control = available_controls[control_index]
-                return [{
+        results = []
+        for item in mapping_json.get('selected_controls', []):
+            number = item.get('number', 0)
+            if 1 <= number <= len(controls_json):
+                control = available_controls[number - 1]
+                results.append({
                     'control_code': control['code'],
                     'control_title': control['title'],
                     'framework_name': control.get('framework', 'Unknown'),
-                    'confidence': max(0.0, min(1.0, float(confidence))),
-                    'reasoning': reasoning[:200]  # Limit length
-                }]
-        
-        logger.warning(f"Invalid control number {selected_number} in JSON mapping")
-        return []
-        
+                    'confidence': max(0.0, min(1.0, float(item.get('confidence', 0.5)))),
+                    'reasoning': item.get('reasoning', 'AI analysis')[:200]
+                })
+
+        if not results:
+            logger.warning(f"No valid controls in JSON mapping: {mapping_json}")
+        return results
+
     except Exception as e:
         logger.error(f"Failed to convert JSON mapping: {e}")
         return []
@@ -244,9 +248,73 @@ def _parse_structured_control_response(response_text: str, available_controls: L
         return []
 
 def _analyze_document_openai_two_step(file_text: str, filename: str, available_controls: List[dict], ai_client) -> List[dict]:
-    """Two-step analysis for OpenAI (can use structured outputs natively)"""
-    # For now, use existing OpenAI logic but could be enhanced with structured outputs
-    return []
+    """Two-step analysis for OpenAI: summarise then map to ALL relevant controls."""
+    import json as json_module
+
+    try:
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+        # Step 1: summarise document
+        scan_prompt = f"""Analyze document: {filename}
+Content: {file_text[:5000]}
+
+Return a JSON summary:
+{{"document_type":"<type>","primary_topic":"<topic>","key_content_indicators":["<keyword>"],"security_areas":["<domain>"],"main_requirements":["<requirement>"],"distinguishing_features":"<what makes this unique>"}}"""
+
+        scan_response = ai_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": scan_prompt}],
+            temperature=0.1,
+            max_tokens=500,
+        )
+        document_summary_raw = scan_response.choices[0].message.content or ""
+        logger.info(f"OpenAI Step 1 raw for {filename}: {document_summary_raw[:200]}")
+
+        document_summary_json = _extract_json_from_response(document_summary_raw)
+        if not document_summary_json:
+            logger.warning(f"OpenAI Step 1 failed to produce JSON for {filename}")
+            return generate_fallback_suggestions_from_filename(filename, available_controls)
+
+        # Step 2: map to controls
+        controls_json = []
+        for i, control in enumerate(available_controls, 1):
+            controls_json.append({
+                "number": i,
+                "code": control['code'],
+                "title": control['title'],
+                "framework": control.get('framework', 'Unknown'),
+            })
+
+        mapping_prompt = f"""Document Summary: {json_module.dumps(document_summary_json, indent=2)}
+
+Available Controls: {json_module.dumps(controls_json, indent=2)}
+
+Identify ALL controls from ANY framework that this document provides evidence for.
+Return up to 10 matches as a JSON array, ordered by confidence (highest first).
+Only include controls with genuine relevance (confidence >= 0.5).
+
+Return JSON only:
+{{"selected_controls":[{{"number":1,"confidence":0.90,"reasoning":"Brief match explanation"}},{{"number":4,"confidence":0.75,"reasoning":"Brief match explanation"}}]}}"""
+
+        mapping_response = ai_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": mapping_prompt}],
+            temperature=0.1,
+            max_tokens=800,
+        )
+        mapping_text_raw = mapping_response.choices[0].message.content or ""
+        logger.info(f"OpenAI Step 2 raw for {filename}: {mapping_text_raw}")
+
+        mapping_json = _extract_json_from_response(mapping_text_raw)
+        if not mapping_json:
+            logger.warning(f"OpenAI Step 2 failed to produce JSON for {filename}")
+            return generate_fallback_suggestions_from_filename(filename, available_controls)
+
+        return _convert_json_mapping_to_suggestions(mapping_json, available_controls, controls_json)
+
+    except Exception as e:
+        logger.error(f"OpenAI two-step analysis failed for {filename}: {e}")
+        return generate_fallback_suggestions_from_filename(filename, available_controls)
 
 def generate_fallback_suggestions_from_filename(filename: str, available_controls: List[dict]) -> List[dict]:
     """Generate control suggestions based on filename when AI analysis fails."""
@@ -433,6 +501,11 @@ def _safe_json_loads(json_data, default=None):
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting GeekyGoose Compliance API...")
+    if not os.getenv("ENCRYPTION_KEY"):
+        logger.warning(
+            "ENCRYPTION_KEY is not set. Stored API keys will not be encrypted. "
+            "Set this variable before configuring an OpenAI API key."
+        )
     
     # Initialize database on startup
     if not initialize_database():
@@ -466,15 +539,16 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestValidationMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
 
-# CORS middleware - Allow requests from Next.js container and localhost
+# CORS middleware - Allow requests only from known frontend origins
+_ALLOWED_ORIGINS = list(filter(None, [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://web:3000",
+    os.getenv("FRONTEND_URL"),          # Optional extra origin for production
+]))
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000", 
-        "http://127.0.0.1:3000",
-        "http://web:3000",  # Allow from Next.js container
-        "*"  # Allow all origins since Next.js will proxy requests
-    ],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -736,57 +810,16 @@ async def analyze_file_content_for_controls(file: UploadFile, file_content: byte
         ])
         
         analysis_prompt = f"""
-You are a compliance expert. Analyze this document and identify which compliance controls it relates to.
+You are a compliance expert. Analyze this document and identify ALL compliance controls it provides evidence for, across any framework.
 
 Document: {filename}
-Content: {file_text[:5000]}{'...' if len(file_text) > 50000 else ''}
+Content: {file_text[:5000]}{'...' if len(file_text) > 5000 else ''}
 
 Available compliance controls:
 {controls_context}
 
-⚠️ CRITICAL MAPPING RULES - Follow these EXACTLY:
-
-1. **MACRO/OFFICE SECURITY** = EE-3 ONLY:
-   - If you see: Microsoft Office, Trust Center, macro settings, VBA, macro security, Excel/Word security
-   - Then MUST use: EE-3 "Configure Microsoft Office Macro Settings"
-   - DO NOT use EE-1 or EE-4 for macro content!
-
-2. **OS UPDATES/PATCHES** = EE-6:
-   - Windows Update, OS patches, system updates, firmware updates
-   - Use: EE-6 "Patch Operating Systems"
-
-3. **APP UPDATES** = EE-2:
-   - Application updates, software patches (not OS)
-   - Use: EE-2 "Patch Applications"
-
-4. **AUTHENTICATION** = EE-5:
-   - MFA, 2FA, multi-factor authentication
-   - Use: EE-5 "Multi-Factor Authentication"
-
-5. **BACKUPS** = EE-7:
-   - Backup settings, recovery points
-   - Use: EE-7 "Backup Data"
-
-6. **APP WHITELISTING** = EE-1:
-   - Application whitelisting, AppLocker, execution control
-   - Use: EE-1 "Application Control"
-   - NOT for macro settings!
-
-7. **BROWSER HARDENING** = EE-4:
-   - Browser security, application hardening
-   - Use: EE-4 "User Application Hardening"
-
-8. **ADMIN ACCESS** = EE-8:
-   - Admin restrictions, privileged access
-   - Use: EE-8 "Restrict Admin Privileges"
-
-Analyze the document content and provide the top 3 most relevant controls.
-For each control, provide:
-- control_code: The exact control code
-- control_title: The exact control title
-- framework_name: The framework name
-- confidence: A number between 0.0 and 1.0
-- reasoning: Brief explanation (1-2 sentences)
+Identify every control (from any framework above) that this document genuinely supports.
+Return up to 10 matches ordered by confidence (highest first). Only include controls where confidence >= 0.5.
 
 Respond ONLY with valid JSON in this exact format:
 {{
@@ -1031,7 +1064,7 @@ Respond with ONLY this JSON structure:
             # Parse AI response with improved error handling
             try:
                 # Log the raw response for debugging
-                logger.info(f"Raw AI response for {filename}: {repr(ai_response[:500])}")
+                logger.debug(f"Raw AI response for {filename}: {repr(ai_response[:200])}")
                 
                 # Check if response looks like an error message
                 if ai_response and ("error" in ai_response.lower() or "internal server" in ai_response.lower() or ai_response.startswith("HTTP/")):
@@ -1357,31 +1390,33 @@ async def process_document_ai_analysis_background(document_id: str, filename: st
             # Update document with AI processing complete status
             document = db.query(Document).filter(Document.id == document_id).first()
             if document and suggested_controls:
-                # Find the suggested control in database
-                control = db.query(Control).filter(Control.code == suggested_controls[0]['control_code']).first()
-                if control:
-                    confidence = suggested_controls[0].get('confidence', 0.0)
-
-                    # Only create link if confidence meets threshold
-                    if confidence >= min_threshold:
-                        # Create document-control link
-                        existing_link = db.query(DocumentControlLink).filter_by(
-                            document_id=document_id,
-                            control_id=control.id
-                        ).first()
-
-                        if not existing_link:
-                            link = DocumentControlLink(
-                                document_id=document_id,
-                                control_id=control.id,
-                                confidence=confidence,
-                                reasoning=suggested_controls[0].get('reasoning', 'AI analysis')
-                            )
-                            db.add(link)
-                            db.commit()
-                            logger.info(f"Created document-control link: {document.filename} → {control.code} (confidence: {confidence:.2f})")
-                    else:
+                links_created = 0
+                for suggestion in suggested_controls:
+                    control = db.query(Control).filter(Control.code == suggestion['control_code']).first()
+                    if not control:
+                        logger.warning(f"Control code not found in DB: {suggestion['control_code']}")
+                        continue
+                    confidence = suggestion.get('confidence', 0.0)
+                    if confidence < min_threshold:
                         logger.info(f"Skipped link for {document.filename} → {control.code}: confidence {confidence:.2f} below threshold {min_threshold}")
+                        continue
+                    existing_link = db.query(DocumentControlLink).filter_by(
+                        document_id=document_id,
+                        control_id=control.id
+                    ).first()
+                    if not existing_link:
+                        link = DocumentControlLink(
+                            document_id=document_id,
+                            control_id=control.id,
+                            confidence=confidence,
+                            reasoning=suggestion.get('reasoning', 'AI analysis')
+                        )
+                        db.add(link)
+                        links_created += 1
+                        logger.info(f"Created document-control link: {document.filename} → {control.code} (confidence: {confidence:.2f})")
+                if links_created:
+                    db.commit()
+                    logger.info(f"Committed {links_created} control link(s) for document {document_id}")
             
             db.close()
         except Exception as e:
@@ -1505,6 +1540,147 @@ def generate_essential_eight_suggestions_from_filename(filename: str, available_
     
     return suggestions
 
+def _validate_endpoint_url(url: str) -> None:
+    """
+    Validate that a user-supplied URL is safe to use for outbound HTTP requests.
+    Blocks dangerous schemes and known cloud-metadata addresses.
+    Private/loopback IPs are allowed because Ollama legitimately runs locally.
+    """
+    import ipaddress
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid endpoint URL")
+
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Endpoint URL must use http or https")
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise HTTPException(status_code=400, detail="Invalid endpoint URL: missing hostname")
+
+    # Block well-known cloud metadata hostnames
+    _BLOCKED_HOSTS = {
+        "169.254.169.254",           # AWS / GCP / Azure IMDS
+        "metadata.google.internal",  # GCP metadata
+        "169.254.170.2",             # ECS task metadata
+    }
+    if hostname.lower() in _BLOCKED_HOSTS:
+        raise HTTPException(status_code=400, detail="Endpoint URL points to a restricted address")
+
+    # If the hostname is a literal IP, reject link-local (covers the metadata range)
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if ip.is_link_local:
+            raise HTTPException(status_code=400, detail="Endpoint URL points to a restricted address")
+    except ValueError:
+        pass  # Not an IP literal — hostname resolution is fine
+
+
+# ── Auth models ──────────────────────────────────────────────────────────────
+
+from pydantic import field_validator
+
+_auth_rate_store: dict[str, list[datetime]] = defaultdict(list)
+_AUTH_RATE_LIMIT = 10
+_AUTH_RATE_WINDOW_SECS = 60
+
+
+def _auth_rate_limit(req: Request) -> None:
+    """Dependency: limit auth endpoint calls to 10 per minute per IP."""
+    ip = req.client.host if req.client else "unknown"
+    now = datetime.utcnow()
+    cutoff = now - timedelta(seconds=_AUTH_RATE_WINDOW_SECS)
+    attempts = [t for t in _auth_rate_store[ip] if t > cutoff]
+    if len(attempts) >= _AUTH_RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Please wait before trying again.",
+            headers={"Retry-After": str(_AUTH_RATE_WINDOW_SECS)},
+        )
+    attempts.append(now)
+    _auth_rate_store[ip] = attempts
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    name: str
+    password: str
+    org_name: str
+
+    @field_validator("password")
+    @classmethod
+    def password_min_length(cls, v: str) -> str:
+        if len(v) < 12:
+            raise ValueError("Password must be at least 12 characters")
+        return v
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/auth/register", tags=["auth"])
+async def register(
+    body: RegisterRequest,
+    _rl: None = Depends(_auth_rate_limit),
+    db: Session = Depends(get_db),
+):
+    """Register a new user and organisation."""
+    if db.query(User).filter(User.email == body.email).first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    org = Org(id=uuid.uuid4(), name=body.org_name)
+    db.add(org)
+    db.flush()
+
+    user = User(
+        id=uuid.uuid4(),
+        org_id=org.id,
+        email=body.email,
+        name=body.name,
+        role="admin",  # First user in the org gets admin
+        password_hash=get_password_hash(body.password),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    token = create_access_token({"sub": str(user.id)})
+    return {"access_token": token, "token_type": "bearer", "user_id": str(user.id)}
+
+
+@app.post("/auth/login", tags=["auth"])
+async def login(
+    body: LoginRequest,
+    _rl: None = Depends(_auth_rate_limit),
+    db: Session = Depends(get_db),
+):
+    """Authenticate and receive a JWT bearer token."""
+    user = db.query(User).filter(User.email == body.email).first()
+    if not user or not user.password_hash or not verify_password(body.password, user.password_hash):
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = create_access_token({"sub": str(user.id)})
+    return {"access_token": token, "token_type": "bearer", "user_id": str(user.id)}
+
+
+@app.get("/setup/status", tags=["setup"])
+async def setup_status(db: Session = Depends(get_db)):
+    """
+    Unauthenticated endpoint. Returns whether initial admin setup is still required.
+    The frontend uses this to decide whether to show the first-run setup page.
+    """
+    has_users = db.query(User).first() is not None
+    return {"setup_required": not has_users}
+
+
 @app.get("/")
 async def root():
     return {"message": "GeekyGoose Compliance API is running"}
@@ -1516,23 +1692,34 @@ async def health():
 @app.post("/documents/upload")
 async def upload_document(
     file: UploadFile = File(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    # Validate file type
-    if file.content_type not in ALLOWED_MIME_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File type {file.content_type} not allowed. Allowed types: {', '.join(ALLOWED_MIME_TYPES)}"
-        )
-    
-    # Check file size
+    # Check file size first (read entire content)
     file_content = await file.read()
     if len(file_content) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=400,
             detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB"
         )
-    
+
+    # Validate actual file content type via magic bytes (not the client-supplied header)
+    try:
+        import magic as _magic
+        detected_mime = _magic.from_buffer(file_content[:2048], mime=True)
+        if detected_mime not in ALLOWED_MIME_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File content does not match an allowed type. Detected: {detected_mime}",
+            )
+    except ImportError:
+        # python-magic unavailable — fall back to header check
+        if file.content_type not in ALLOWED_MIME_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File type {file.content_type} not allowed. Allowed types: {', '.join(ALLOWED_MIME_TYPES)}",
+            )
+
     # Reset file position
     await file.seek(0)
     
@@ -1542,34 +1729,14 @@ async def upload_document(
             file.file, file.filename, file.content_type
         )
         
-        # For demo purposes, create a default org and user if they don't exist
-        org = db.query(Org).first()
-        if not org:
-            org = Org(id=uuid.uuid4(), name="Demo Organization")
-            db.add(org)
-            db.commit()
-            db.refresh(org)
-        
-        user = db.query(User).filter(User.org_id == org.id).first()
-        if not user:
-            user = User(
-                id=uuid.uuid4(),
-                org_id=org.id,
-                email="demo@example.com",
-                name="Demo User"
-            )
-            db.add(user)
-            db.commit()
-            db.refresh(user)
-        
         # Save to database
         document = Document(
-            org_id=org.id,
+            org_id=current_user.org_id,
             filename=file.filename,
             mime_type=file.content_type,
             storage_key=storage_key,
             file_size=file_size,
-            uploaded_by=user.id,
+            uploaded_by=current_user.id,
             sha256=sha256_hash
         )
         
@@ -1629,18 +1796,18 @@ async def upload_document(
             "file_size": document.file_size,
             "sha256": document.sha256,
             "created_at": document.created_at.isoformat(),
-            "download_url": storage.get_download_url(storage_key),
+            "download_url": f"/api/documents/{document.id}/download",
             "suggested_controls": suggested_controls
         }
         
     except Exception as e:
         logger.error(f"Upload failed for {file.filename if file else 'unknown file'}: {e}")
         logger.exception("Full upload error details:")
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Upload failed. Please try again.")
 
 @app.get("/documents")
-async def list_documents(db: Session = Depends(get_db)):
-    documents = db.query(Document).order_by(Document.created_at.desc()).all()
+async def list_documents(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    documents = db.query(Document).filter(Document.org_id == current_user.org_id).order_by(Document.created_at.desc()).all()
     
     result = []
     for doc in documents:
@@ -1671,9 +1838,9 @@ async def list_documents(db: Session = Depends(get_db)):
     return {"documents": result}
 
 @app.get("/documents/{document_id}/download")
-async def download_document(document_id: str, db: Session = Depends(get_db)):
+async def download_document(document_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Download a document file."""
-    document = db.query(Document).filter(Document.id == document_id).first()
+    document = db.query(Document).filter(Document.id == document_id, Document.org_id == current_user.org_id).first()
     
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -1693,11 +1860,13 @@ async def download_document(document_id: str, db: Session = Depends(get_db)):
         logger.info(f"Retrieved file content, size: {len(file_content)} bytes")
         
         from fastapi.responses import Response
+        from urllib.parse import quote as _quote
+        safe_filename = _quote(document.filename, safe='')
         return Response(
             content=file_content,
             media_type=document.mime_type,
             headers={
-                "Content-Disposition": f"attachment; filename=\"{document.filename}\""
+                "Content-Disposition": f"attachment; filename*=UTF-8''{safe_filename}"
             }
         )
     except HTTPException:
@@ -1709,7 +1878,7 @@ async def download_document(document_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
 
 @app.post("/reports/comprehensive-analysis")
-async def run_comprehensive_ai_analysis(request: dict, db: Session = Depends(get_db)):
+async def run_comprehensive_ai_analysis(request: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Run comprehensive AI analysis across all documents and controls."""
     try:
         framework_id = request.get('framework_id')
@@ -1718,14 +1887,17 @@ async def run_comprehensive_ai_analysis(request: dict, db: Session = Depends(get
         
         logger.info(f"Starting comprehensive AI analysis for framework {framework_id}")
         
-        # Get all documents (AI processing status determined by control links)
-        documents = db.query(Document).all()
-        
+        # Get all documents scoped to the user's org
+        documents = db.query(Document).filter(Document.org_id == current_user.org_id).all()
+
         # Get all controls for the framework
         controls = db.query(Control).filter(Control.framework_id == framework_id).all()
-        
-        # Get all document-control links
-        control_links = db.query(DocumentControlLink).all()
+
+        # Get org-scoped document-control links
+        org_doc_ids = {doc.id for doc in documents}
+        control_links = db.query(DocumentControlLink).filter(
+            DocumentControlLink.document_id.in_(org_doc_ids)
+        ).all() if org_doc_ids else []
         
         # Filter documents that have AI processing (have control links)
         ai_processed_document_ids = set(link.document_id for link in control_links)
@@ -1873,15 +2045,15 @@ async def run_comprehensive_ai_analysis(request: dict, db: Session = Depends(get
         
     except Exception as e:
         logger.error(f"Comprehensive analysis failed: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Analysis failed. Please try again.")
 
 @app.get("/documents/{document_id}/ai-status")
-async def get_document_ai_status(document_id: str, db: Session = Depends(get_db)):
+async def get_document_ai_status(document_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Check if AI processing is complete for a document."""
     try:
-        document = db.query(Document).filter(Document.id == document_id).first()
+        document = db.query(Document).filter(Document.id == document_id, Document.org_id == current_user.org_id).first()
         if not document:
-            # Document was deleted, return completed status to stop polling
+            # Document was deleted or belongs to another org
             return {
                 "document_id": document_id,
                 "filename": "Deleted Document",
@@ -1913,7 +2085,7 @@ async def get_document_ai_status(document_id: str, db: Session = Depends(get_db)
         raise HTTPException(status_code=500, detail="Failed to get AI status")
 
 @app.post("/admin/retry-ai-processing")
-async def manual_retry_ai_processing():
+async def manual_retry_ai_processing(current_user: User = Depends(require_admin)):
     """Manually trigger AI processing retry for unprocessed documents."""
     try:
         await retry_ai_processing()
@@ -1923,8 +2095,8 @@ async def manual_retry_ai_processing():
         raise HTTPException(status_code=500, detail="Failed to trigger AI processing retry")
 
 @app.delete("/documents/{document_id}")
-async def delete_document(document_id: str, db: Session = Depends(get_db)):
-    document = db.query(Document).filter(Document.id == document_id).first()
+async def delete_document(document_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    document = db.query(Document).filter(Document.id == document_id, Document.org_id == current_user.org_id).first()
     
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -1964,7 +2136,7 @@ class CreateScanRequest(BaseModel):
 
 # Frameworks and Controls endpoints
 @app.get("/frameworks")
-async def list_frameworks(db: Session = Depends(get_db)):
+async def list_frameworks(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """List all available compliance frameworks."""
     frameworks = db.query(Framework).all()
     return {
@@ -1981,7 +2153,7 @@ async def list_frameworks(db: Session = Depends(get_db)):
     }
 
 @app.get("/frameworks/{framework_id}/controls")
-async def list_controls(framework_id: str, db: Session = Depends(get_db)):
+async def list_controls(framework_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """List all controls for a framework."""
     controls = db.query(Control).filter(Control.framework_id == framework_id).all()
     
@@ -2024,7 +2196,7 @@ def get_control_by_id_or_code(db: Session, control_identifier: str) -> Control:
     return control
 
 @app.get("/controls/{control_id}")
-async def get_control_details(control_id: str, db: Session = Depends(get_db)):
+async def get_control_details(control_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Get detailed information about a specific control."""
     control = get_control_by_id_or_code(db, control_id)
     if not control:
@@ -2057,15 +2229,16 @@ async def link_evidence_to_control(
     document_id: str,
     request: LinkEvidenceRequest,
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Link a document as evidence for a control/requirement."""
     
-    # Verify document exists
-    document = db.query(Document).filter(Document.id == document_id).first()
+    # Verify document exists and belongs to the user's org
+    document = db.query(Document).filter(Document.id == document_id, Document.org_id == current_user.org_id).first()
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
-    
+
     # Verify control exists
     control = db.query(Control).filter(Control.id == request.control_id).first()
     if not control:
@@ -2109,7 +2282,7 @@ async def link_evidence_to_control(
     }
 
 @app.get("/controls/{control_id}/evidence")
-async def get_control_evidence(control_id: str, db: Session = Depends(get_db)):
+async def get_control_evidence(control_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Get all evidence linked to a control (both AI-linked and manual)."""
 
     # Find the control by ID or code
@@ -2133,7 +2306,7 @@ async def get_control_evidence(control_id: str, db: Session = Depends(get_db)):
                 "mime_type": link.document.mime_type,
                 "file_size": link.document.file_size,
                 "created_at": link.document.created_at.isoformat(),
-                "download_url": storage.get_download_url(link.document.storage_key)
+                "download_url": f"/api/documents/{link.document.id}/download"
             },
             "requirement": None,  # AI links are control-level, not requirement-level
             "note": "",
@@ -2143,9 +2316,10 @@ async def get_control_evidence(control_id: str, db: Session = Depends(get_db)):
             "is_ai_linked": True
         })
 
-    # Get manually linked evidence (EvidenceLink)
+    # Get manually linked evidence (EvidenceLink) scoped to org
     manual_links = db.query(EvidenceLink).filter(
-        EvidenceLink.control_id == control.id
+        EvidenceLink.control_id == control.id,
+        EvidenceLink.org_id == current_user.org_id,
     ).all()
 
     for link in manual_links:
@@ -2157,7 +2331,7 @@ async def get_control_evidence(control_id: str, db: Session = Depends(get_db)):
                 "mime_type": link.document.mime_type,
                 "file_size": link.document.file_size,
                 "created_at": link.document.created_at.isoformat(),
-                "download_url": storage.get_download_url(link.document.storage_key)
+                "download_url": f"/api/documents/{link.document.id}/download"
             },
             "requirement": {
                 "id": str(link.requirement.id),
@@ -2174,7 +2348,7 @@ async def get_control_evidence(control_id: str, db: Session = Depends(get_db)):
     return {"evidence": result}
 
 @app.get("/controls/{control_id}/documents")
-async def get_control_documents(control_id: str, db: Session = Depends(get_db)):
+async def get_control_documents(control_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Get all documents linked to a specific control via AI analysis."""
     try:
         control = get_control_by_id_or_code(db, control_id)
@@ -2216,10 +2390,15 @@ async def get_control_documents(control_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Failed to get control documents")
 
 @app.delete("/document-control-links/{link_id}")
-async def remove_document_control_link(link_id: str, db: Session = Depends(get_db)):
+async def remove_document_control_link(link_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Remove an AI-generated document-control link (for false positives)."""
     try:
-        link = db.query(DocumentControlLink).filter(DocumentControlLink.id == link_id).first()
+        link = (
+            db.query(DocumentControlLink)
+            .join(Document, DocumentControlLink.document_id == Document.id)
+            .filter(DocumentControlLink.id == link_id, Document.org_id == current_user.org_id)
+            .first()
+        )
         if not link:
             raise HTTPException(status_code=404, detail="Link not found")
 
@@ -2241,7 +2420,8 @@ async def remove_document_control_link(link_id: str, db: Session = Depends(get_d
 @app.post("/controls/{control_id}/scan")
 async def create_scan(
     control_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Create a new compliance scan for a control."""
 
@@ -2250,15 +2430,10 @@ async def create_scan(
     if not control:
         raise HTTPException(status_code=404, detail="Control not found")
 
-    # For demo, get default org
-    org = db.query(Org).first()
-    if not org:
-        raise HTTPException(status_code=400, detail="No organization found")
-
-    # Check if there's evidence linked to this control (manual OR AI-linked)
+    # Check if there's evidence linked to this control (manual OR AI-linked) for this org
     manual_evidence_count = db.query(EvidenceLink).filter(
         EvidenceLink.control_id == control.id,
-        EvidenceLink.org_id == org.id
+        EvidenceLink.org_id == current_user.org_id,
     ).count()
 
     ai_evidence_count = db.query(DocumentControlLink).filter(
@@ -2275,7 +2450,7 @@ async def create_scan(
 
     # Create scan record
     scan = Scan(
-        org_id=org.id,
+        org_id=current_user.org_id,
         control_id=control.id,
         status='pending'
     )
@@ -2294,10 +2469,10 @@ async def create_scan(
     }
 
 @app.get("/scans/{scan_id}")
-async def get_scan_status(scan_id: str, db: Session = Depends(get_db)):
+async def get_scan_status(scan_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Get the status and results of a scan."""
     
-    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    scan = db.query(Scan).filter(Scan.id == scan_id, Scan.org_id == current_user.org_id).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
     
@@ -2351,7 +2526,7 @@ async def get_scan_status(scan_id: str, db: Session = Depends(get_db)):
     }
 
 @app.get("/controls/{control_id}/scans")
-async def get_control_scans(control_id: str, db: Session = Depends(get_db)):
+async def get_control_scans(control_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Get all scans for a control."""
 
     # Find the control by ID or code
@@ -2360,7 +2535,8 @@ async def get_control_scans(control_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Control not found")
 
     scans = db.query(Scan).filter(
-        Scan.control_id == control.id
+        Scan.control_id == control.id,
+        Scan.org_id == current_user.org_id,
     ).order_by(Scan.created_at.desc()).all()
     
     return {
@@ -2395,7 +2571,7 @@ class AISettingsRequest(BaseModel):
     use_dual_vision_validation: Optional[bool] = False
 
 @app.get("/settings/ai")
-async def get_ai_settings(db: Session = Depends(get_db)):
+async def get_ai_settings(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Get current AI provider settings from database."""
     # Get or create settings record
     settings = db.query(Settings).filter(Settings.id == 1).first()
@@ -2435,7 +2611,7 @@ async def get_ai_settings(db: Session = Depends(get_db)):
     }
 
 @app.post("/settings/ai")
-async def save_ai_settings(settings_request: AISettingsRequest, db: Session = Depends(get_db)):
+async def save_ai_settings(settings_request: AISettingsRequest, db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
     """Save AI provider settings to database."""
     # Get or create settings record
     settings = db.query(Settings).filter(Settings.id == 1).first()
@@ -2458,7 +2634,7 @@ async def save_ai_settings(settings_request: AISettingsRequest, db: Session = De
 
     # Update OpenAI settings (allow even when provider is Ollama, for dual validation)
     if settings_request.openai_api_key and settings_request.openai_api_key != "***":
-        settings.openai_api_key = settings_request.openai_api_key
+        settings.openai_api_key = encrypt_secret(settings_request.openai_api_key)
     if settings_request.openai_model:
         settings.openai_model = settings_request.openai_model
     if settings_request.openai_vision_model:
@@ -2482,19 +2658,24 @@ async def save_ai_settings(settings_request: AISettingsRequest, db: Session = De
     return {"message": "Settings saved successfully"}
 
 @app.post("/settings/ai/test")
-async def test_ai_connection(settings: AISettingsRequest):
+async def test_ai_connection(settings: AISettingsRequest, current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Test connection to the specified AI provider."""
     try:
         if settings.provider == "openai":
             from openai import OpenAI
-            
+
             if not settings.openai_api_key or settings.openai_api_key == "***":
-                api_key = os.getenv("OPENAI_API_KEY")
+                # Fall back to the key stored in the database (decrypt it)
+                stored = db.query(Settings).filter(Settings.id == 1).first()
+                raw = stored.openai_api_key if stored else None
+                api_key = decrypt_secret(raw) if raw and is_encrypted(raw) else (raw or os.getenv("OPENAI_API_KEY"))
             else:
                 api_key = settings.openai_api_key
-            
-            # Use custom endpoint if provided
+
+            # Use custom endpoint if provided — validate against SSRF
             base_url = settings.openai_endpoint if settings.openai_endpoint else None
+            if base_url:
+                _validate_endpoint_url(base_url)
             
             # Only require API key if using default OpenAI endpoint
             if not api_key and not base_url:
@@ -2523,10 +2704,12 @@ async def test_ai_connection(settings: AISettingsRequest):
             
         elif settings.provider == "ollama":
             import requests
-            
+
             endpoint = settings.ollama_endpoint or "http://localhost:11434"
             model = settings.ollama_model or "llama2"
-            
+
+            _validate_endpoint_url(endpoint)
+
             # Test Ollama connection
             response = requests.post(
                 f"{endpoint}/api/generate",
@@ -2557,11 +2740,12 @@ async def test_ai_connection(settings: AISettingsRequest):
         raise HTTPException(status_code=400, detail=f"Connection test failed: {str(e)}")
 
 @app.get("/settings/ollama/models")
-async def get_ollama_models(endpoint: str = "http://localhost:11434"):
+async def get_ollama_models(endpoint: str = "http://localhost:11434", current_user: User = Depends(require_admin)):
     """Get list of available models from Ollama instance."""
+    _validate_endpoint_url(endpoint)
     try:
         import requests
-        
+
         # Get list of models from Ollama
         response = requests.get(f"{endpoint}/api/tags", timeout=10)
         
@@ -2646,17 +2830,20 @@ async def get_demo_ollama_models():
     }
 
 @app.get("/settings/openai/models")
-async def get_openai_models(endpoint: Optional[str] = None, api_key: Optional[str] = None):
+async def get_openai_models(endpoint: Optional[str] = None, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Get list of available models from OpenAI or custom OpenAI-compatible endpoint."""
+    if endpoint:
+        _validate_endpoint_url(endpoint)
     try:
         from openai import OpenAI
-        
+
         # Use provided endpoint or fall back to environment/default
         base_url = endpoint if endpoint else os.getenv("OPENAI_ENDPOINT")
-        
-        # Use provided API key or fall back to environment
-        if not api_key or api_key == "***":
-            api_key = os.getenv("OPENAI_API_KEY")
+
+        # Always read the API key from DB/env — never accept it in the URL (query string leaks to logs)
+        stored = db.query(Settings).filter(Settings.id == 1).first()
+        raw_key = stored.openai_api_key if stored else None
+        api_key = decrypt_secret(raw_key) if raw_key and is_encrypted(raw_key) else (raw_key or os.getenv("OPENAI_API_KEY"))
         
         # Only require API key if using default OpenAI endpoint
         if not api_key and not base_url:
@@ -2841,7 +3028,7 @@ class DocumentBatchAnalysisRequest(BaseModel):
     prompt: str
 
 @app.post("/ai/analyze-text")
-async def analyze_text_with_ai(request: ControlAnalysisRequest):
+async def analyze_text_with_ai(request: ControlAnalysisRequest, current_user: User = Depends(get_current_user)):
     """Analyze text using the configured AI provider."""
     try:
         from ai_scanner import get_ai_client
@@ -2919,7 +3106,8 @@ async def analyze_text_with_ai(request: ControlAnalysisRequest):
 @app.post("/api/ai/analyze-image")
 async def analyze_image_with_ai(
     image: UploadFile = File(...),
-    prompt: str = Form(...)
+    prompt: str = Form(...),
+    current_user: User = Depends(get_current_user),
 ):
     """Analyze an image using vision AI and suggest compliance controls."""
     try:
@@ -3068,7 +3256,7 @@ async def analyze_image_with_ai(
         )
 
 @app.post("/analyze-documents")
-async def analyze_multiple_documents(request: DocumentBatchAnalysisRequest):
+async def analyze_multiple_documents(request: DocumentBatchAnalysisRequest, current_user: User = Depends(get_current_user)):
     """Analyze multiple documents together and suggest relevant compliance controls."""
     try:
         from ai_scanner import get_ai_client
@@ -3193,7 +3381,8 @@ Do not include any text before or after the JSON. Do not use markdown formatting
 @app.post("/analyze-document-controls")
 async def analyze_document_controls(
     file: UploadFile = File(...),
-    available_controls: Optional[str] = None
+    available_controls: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
 ):
     """Analyze uploaded document and suggest relevant compliance controls."""
     try:
