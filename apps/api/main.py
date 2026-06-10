@@ -20,8 +20,8 @@ from middleware import (
     AIProcessingError,
     FileProcessingError
 )
-from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import or_, func
 from database import get_db
 from models import Document, Org, User, Framework, Control, Requirement, EvidenceLink, Scan, ScanResult, Gap, DocumentControlLink, DocumentPage, Settings
 from storage import storage
@@ -565,8 +565,8 @@ ALLOWED_MIME_TYPES = {
 
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
-async def analyze_file_content_for_controls(file: UploadFile, file_content: bytes) -> list:
-    """Analyze file content and suggest relevant compliance controls."""
+async def analyze_file_content_for_controls(file: UploadFile, file_content: bytes, org_id) -> list:
+    """Analyze file content and suggest relevant compliance controls (scoped to org_id's AI settings)."""
     try:
         # Get available templates/controls from the database
         from database import SessionLocal
@@ -689,7 +689,7 @@ async def analyze_file_content_for_controls(file: UploadFile, file_content: byte
                 except Exception:
                     processed_content = file_content
                 
-                ai_client = get_ai_client()
+                ai_client = get_ai_client(org_id)
                 image_b64 = base64.b64encode(processed_content).decode('utf-8')
                 
                 if not isinstance(ai_client, dict):  # OpenAI
@@ -840,7 +840,7 @@ Do not include any text before or after the JSON. Return empty suggestions array
         try:
             from ai_scanner import get_ai_client
             logger.info(f"Attempting to get AI client for {filename}")
-            ai_client = get_ai_client()
+            ai_client = get_ai_client(org_id)
             logger.info(f"AI client initialized: {type(ai_client)}")
             
             # Use the new two-step analysis approach
@@ -1165,10 +1165,10 @@ Respond with ONLY this JSON structure:
         return []
 
 # Ensure the function always returns a list
-async def safe_analyze_file_content_for_controls(file, file_content):
+async def safe_analyze_file_content_for_controls(file, file_content, org_id):
     """Wrapper for analyze_file_content_for_controls that ensures it always returns a list."""
     try:
-        result = await analyze_file_content_for_controls(file, file_content)
+        result = await analyze_file_content_for_controls(file, file_content, org_id)
         if not isinstance(result, list):
             logger.warning(f"analyze_file_content_for_controls returned non-list: {type(result)}")
             return []
@@ -1199,7 +1199,7 @@ def find_unprocessed_documents() -> List[Document]:
         unprocessed = db.query(Document).outerjoin(DocumentControlLink).filter(
             Document.created_at < one_hour_ago  # Created over 1 hour ago
         ).group_by(Document.id).having(
-            db.func.count(DocumentControlLink.id) == 0  # No associated control links
+            func.count(DocumentControlLink.id) == 0  # No associated control links
         ).all()
         
         db.close()
@@ -1216,18 +1216,14 @@ async def retry_ai_processing():
         logger.info("Starting hourly AI processing retry check...")
         unprocessed_docs = find_unprocessed_documents()
         
+        from worker_tasks import process_document_ai_analysis
         for doc in unprocessed_docs:
             try:
-                logger.info(f"Retrying AI processing for document: {doc.id} - {doc.filename}")
-                
-                # Download the document content from storage
-                file_content = storage.download(doc.storage_key)
-                
-                # Process in background
-                await process_document_ai_analysis_background(str(doc.id), doc.filename, file_content)
-                
+                logger.info(f"Re-queuing AI processing for document: {doc.id} - {doc.filename}")
+                # Offload to the Celery ai_tasks queue rather than blocking the event loop
+                process_document_ai_analysis.delay(str(doc.id), str(doc.org_id))
             except Exception as e:
-                logger.error(f"Failed to retry AI processing for document {doc.id}: {e}")
+                logger.error(f"Failed to queue AI processing for document {doc.id}: {e}")
                 
     except Exception as e:
         logger.error(f"Error during AI processing retry: {e}")
@@ -1242,8 +1238,8 @@ async def periodic_ai_retry_task():
             logger.error(f"Error in periodic AI retry task: {e}")
             await asyncio.sleep(300)  # Wait 5 minutes before trying again
 
-async def process_document_ai_analysis_background(document_id: str, filename: str, file_content: bytes):
-    """Process AI analysis in background and store results."""
+async def process_document_ai_analysis_background(document_id: str, filename: str, file_content: bytes, org_id):
+    """Process AI analysis in background and store results (scoped to org_id's AI settings)."""
     try:
         logger.info(f"Starting background AI analysis for document {document_id}: {filename}")
         
@@ -1272,9 +1268,9 @@ async def process_document_ai_analysis_background(document_id: str, filename: st
                 return self._content
         
         mock_file = MockFile(filename, file_content)
-        
+
         # Perform the AI analysis
-        suggested_controls = await safe_analyze_file_content_for_controls(mock_file, file_content)
+        suggested_controls = await safe_analyze_file_content_for_controls(mock_file, file_content, org_id)
         
         if not suggested_controls:
             # Use filename fallback if AI analysis fails - get available controls from database
@@ -1312,24 +1308,24 @@ async def process_document_ai_analysis_background(document_id: str, filename: st
             SessionLocal = sessionmaker(bind=engine)
             db = SessionLocal()
             
-            # Get confidence threshold and dual vision settings
-            from models import Settings
-            settings = db.query(Settings).filter(Settings.id == 1).first()
-            min_threshold = settings.min_confidence_threshold if settings else 0.90
-            use_dual_vision = bool(settings.use_dual_vision_validation) if settings and hasattr(settings, 'use_dual_vision_validation') else False
+            # Get confidence threshold and dual vision settings for this org
+            from ai_scanner import get_or_create_settings
+            settings = get_or_create_settings(db, org_id)
+            min_threshold = settings.min_confidence_threshold if settings.min_confidence_threshold is not None else 0.90
+            use_dual_vision = bool(settings.use_dual_vision_validation)
 
             # Log which mode we're using
             if use_dual_vision:
                 logger.info(f"📸 DUAL VISION MODE: Will validate with both GPT-4o AND Qwen2-VL")
             else:
-                logger.info(f"📸 SINGLE MODEL MODE: Using configured provider ({settings.ai_provider if settings else 'default'})")
+                logger.info(f"📸 SINGLE MODEL MODE: Using configured provider ({settings.ai_provider})")
 
             if use_dual_vision and suggested_controls:
                 logger.info(f"Dual vision validation enabled for document {document_id}")
                 try:
                     # Re-analyze with both vision models
                     from ai_scanner import get_vision_clients_for_dual_validation
-                    vision_clients = get_vision_clients_for_dual_validation()
+                    vision_clients = get_vision_clients_for_dual_validation(org_id)
 
                     if len(vision_clients) >= 2:
                         logger.info(f"Running dual vision validation with {len(vision_clients)} models")
@@ -1341,7 +1337,7 @@ async def process_document_ai_analysis_background(document_id: str, filename: st
                                 logger.info(f"Analyzing with {provider_name} - {client_info['model']}")
                                 # Re-analyze the document with this specific client
                                 mock_file = MockFile(filename, file_content)
-                                result = await safe_analyze_file_content_for_controls(mock_file, file_content)
+                                result = await safe_analyze_file_content_for_controls(mock_file, file_content, org_id)
                                 if result:
                                     dual_results.append({
                                         'provider': provider_name,
@@ -1547,6 +1543,7 @@ def _validate_endpoint_url(url: str) -> None:
     Private/loopback IPs are allowed because Ollama legitimately runs locally.
     """
     import ipaddress
+    import socket
     from urllib.parse import urlparse
 
     try:
@@ -1570,13 +1567,33 @@ def _validate_endpoint_url(url: str) -> None:
     if hostname.lower() in _BLOCKED_HOSTS:
         raise HTTPException(status_code=400, detail="Endpoint URL points to a restricted address")
 
-    # If the hostname is a literal IP, reject link-local (covers the metadata range)
-    try:
-        ip = ipaddress.ip_address(hostname)
+    def _reject_if_restricted(ip_str: str) -> None:
+        """Reject link-local (covers the cloud-metadata range). Private/loopback
+        are intentionally allowed because Ollama legitimately runs locally."""
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return
         if ip.is_link_local:
             raise HTTPException(status_code=400, detail="Endpoint URL points to a restricted address")
+
+    # If the hostname is a literal IP, check it directly.
+    try:
+        ipaddress.ip_address(hostname)
+        _reject_if_restricted(hostname)
+        return
     except ValueError:
-        pass  # Not an IP literal — hostname resolution is fine
+        pass  # Not an IP literal — resolve the name and check every address it maps to
+
+    # Resolve the hostname and apply the same checks to ALL resolved addresses,
+    # so a name that points at 169.254.169.254 (DNS rebinding) is still blocked.
+    try:
+        resolved = socket.getaddrinfo(hostname, parsed.port or None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        raise HTTPException(status_code=400, detail="Endpoint URL host could not be resolved")
+
+    for family, _type, _proto, _canon, sockaddr in resolved:
+        _reject_if_restricted(sockaddr[0])
 
 
 # ── Auth models ──────────────────────────────────────────────────────────────
@@ -1752,22 +1769,17 @@ async def upload_document(
         except Exception as e:
             logger.error(f"Failed to trigger text extraction for {file.filename}: {e}")
 
-        # Return immediate response without AI analysis to prevent timeouts
-        # AI analysis will be processed in background
+        # Return immediate response without AI analysis to prevent timeouts.
+        # AI analysis runs on the Celery ai_tasks queue (concurrency=1) so the
+        # blocking AI/OCR/HTTP work never stalls the API event loop.
         suggested_controls = []
 
-        # Start background AI analysis (but don't wait for it)
-        import asyncio
         try:
-            # Schedule AI analysis in background
-            asyncio.create_task(process_document_ai_analysis_background(
-                document.id,
-                file.filename,
-                file_content
-            ))
-            logger.info(f"Scheduled background AI analysis for {file.filename}")
+            from worker_tasks import process_document_ai_analysis
+            ai_task = process_document_ai_analysis.delay(str(document.id), str(current_user.org_id))
+            logger.info(f"Queued background AI analysis for {file.filename}: {ai_task.id}")
         except Exception as e:
-            logger.error(f"Failed to schedule background AI analysis for {file.filename}: {e}")
+            logger.error(f"Failed to queue background AI analysis for {file.filename}: {e}")
         
         # Provide immediate filename-based suggestion for quick feedback
         try:
@@ -1807,13 +1819,19 @@ async def upload_document(
 
 @app.get("/documents")
 async def list_documents(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    documents = db.query(Document).filter(Document.org_id == current_user.org_id).order_by(Document.created_at.desc()).all()
-    
+    documents = (
+        db.query(Document)
+        .filter(Document.org_id == current_user.org_id)
+        .options(selectinload(Document.control_links).selectinload(DocumentControlLink.control))
+        .order_by(Document.created_at.desc())
+        .all()
+    )
+
     result = []
     for doc in documents:
-        # Check if document has control links (AI processing complete)
-        links = db.query(DocumentControlLink).filter(DocumentControlLink.document_id == doc.id).all()
-        
+        # Control links were eager-loaded above (no per-document query)
+        links = doc.control_links
+
         result.append({
             "id": str(doc.id),
             "filename": doc.filename,
@@ -1875,7 +1893,7 @@ async def download_document(document_id: str, db: Session = Depends(get_db), cur
     except Exception as e:
         logger.error(f"Download failed for document {document_id}: {type(e).__name__}: {e}")
         logger.error(f"Document details: filename={document.filename}, storage_key={document.storage_key}")
-        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Download failed. Please try again.")
 
 @app.post("/reports/comprehensive-analysis")
 async def run_comprehensive_ai_analysis(request: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -1977,7 +1995,7 @@ async def run_comprehensive_ai_analysis(request: dict, db: Session = Depends(get
         
         # Run AI analysis on the overall compliance state
         from ai_scanner import get_ai_client
-        ai_client = get_ai_client()
+        ai_client = get_ai_client(current_user.org_id)
         if ai_client and not isinstance(ai_client, dict):
             try:
                 analysis_prompt = f"""
@@ -2123,7 +2141,8 @@ async def delete_document(document_id: str, db: Session = Depends(get_db), curre
         
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
+        logger.error(f"Delete failed for document {document_id}: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Delete failed. Please try again.")
 
 # Pydantic models for API requests
 class LinkEvidenceRequest(BaseModel):
@@ -2160,8 +2179,16 @@ async def list_controls(framework_id: str, db: Session = Depends(get_db), curren
     result = []
     for control in controls:
         requirements = db.query(Requirement).filter(Requirement.control_id == control.id).all()
-        # Count linked documents for this control
-        linked_docs_count = db.query(DocumentControlLink).filter(DocumentControlLink.control_id == control.id).count()
+        # Count linked documents for this control, scoped to the caller's org
+        linked_docs_count = (
+            db.query(DocumentControlLink)
+            .join(Document, DocumentControlLink.document_id == Document.id)
+            .filter(
+                DocumentControlLink.control_id == control.id,
+                Document.org_id == current_user.org_id,
+            )
+            .count()
+        )
         
         result.append({
             "id": str(control.id),
@@ -2292,10 +2319,16 @@ async def get_control_evidence(control_id: str, db: Session = Depends(get_db), c
 
     result = []
 
-    # Get AI-linked evidence (DocumentControlLink)
-    ai_links = db.query(DocumentControlLink).filter(
-        DocumentControlLink.control_id == control.id
-    ).all()
+    # Get AI-linked evidence (DocumentControlLink), scoped to the caller's org
+    ai_links = (
+        db.query(DocumentControlLink)
+        .join(Document, DocumentControlLink.document_id == Document.id)
+        .filter(
+            DocumentControlLink.control_id == control.id,
+            Document.org_id == current_user.org_id,
+        )
+        .all()
+    )
 
     for link in ai_links:
         result.append({
@@ -2355,9 +2388,17 @@ async def get_control_documents(control_id: str, db: Session = Depends(get_db), 
         if not control:
             raise HTTPException(status_code=404, detail="Control not found")
 
-        # Get all document links for this control
-        links = db.query(DocumentControlLink).filter(DocumentControlLink.control_id == control.id).all()
-        
+        # Get all document links for this control, scoped to the caller's org
+        links = (
+            db.query(DocumentControlLink)
+            .join(Document, DocumentControlLink.document_id == Document.id)
+            .filter(
+                DocumentControlLink.control_id == control.id,
+                Document.org_id == current_user.org_id,
+            )
+            .all()
+        )
+
         documents = []
         for link in links:
             document = link.document
@@ -2436,9 +2477,15 @@ async def create_scan(
         EvidenceLink.org_id == current_user.org_id,
     ).count()
 
-    ai_evidence_count = db.query(DocumentControlLink).filter(
-        DocumentControlLink.control_id == control.id
-    ).count()
+    ai_evidence_count = (
+        db.query(DocumentControlLink)
+        .join(Document, DocumentControlLink.document_id == Document.id)
+        .filter(
+            DocumentControlLink.control_id == control.id,
+            Document.org_id == current_user.org_id,
+        )
+        .count()
+    )
 
     total_evidence = manual_evidence_count + ai_evidence_count
 
@@ -2572,28 +2619,9 @@ class AISettingsRequest(BaseModel):
 
 @app.get("/settings/ai")
 async def get_ai_settings(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """Get current AI provider settings from database."""
-    # Get or create settings record
-    settings = db.query(Settings).filter(Settings.id == 1).first()
-
-    if not settings:
-        # Create default settings if none exist
-        settings = Settings(
-            id=1,
-            ai_provider=os.getenv("AI_PROVIDER", "ollama"),
-            openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            openai_endpoint=os.getenv("OPENAI_ENDPOINT"),
-            ollama_endpoint=os.getenv("OLLAMA_ENDPOINT", "http://host.docker.internal:11434"),
-            ollama_model=os.getenv("OLLAMA_MODEL", "qwen2.5:14b"),
-            ollama_context_size=int(os.getenv("OLLAMA_CONTEXT_SIZE", "131072"))
-        )
-        # Set API key from env if available
-        if os.getenv("OPENAI_API_KEY"):
-            settings.openai_api_key = os.getenv("OPENAI_API_KEY")
-
-        db.add(settings)
-        db.commit()
-        db.refresh(settings)
+    """Get current AI provider settings for the caller's organisation."""
+    from ai_scanner import get_or_create_settings
+    settings = get_or_create_settings(db, current_user.org_id)
 
     return {
         "provider": settings.ai_provider,
@@ -2612,13 +2640,9 @@ async def get_ai_settings(db: Session = Depends(get_db), current_user: User = De
 
 @app.post("/settings/ai")
 async def save_ai_settings(settings_request: AISettingsRequest, db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
-    """Save AI provider settings to database."""
-    # Get or create settings record
-    settings = db.query(Settings).filter(Settings.id == 1).first()
-
-    if not settings:
-        settings = Settings(id=1)
-        db.add(settings)
+    """Save AI provider settings for the caller's organisation."""
+    from ai_scanner import get_or_create_settings
+    settings = get_or_create_settings(db, current_user.org_id)
 
     # Update settings
     settings.ai_provider = settings_request.provider
@@ -2665,8 +2689,8 @@ async def test_ai_connection(settings: AISettingsRequest, current_user: User = D
             from openai import OpenAI
 
             if not settings.openai_api_key or settings.openai_api_key == "***":
-                # Fall back to the key stored in the database (decrypt it)
-                stored = db.query(Settings).filter(Settings.id == 1).first()
+                # Fall back to the key stored for this org (decrypt it)
+                stored = db.query(Settings).filter(Settings.org_id == current_user.org_id).first()
                 raw = stored.openai_api_key if stored else None
                 api_key = decrypt_secret(raw) if raw and is_encrypted(raw) else (raw or os.getenv("OPENAI_API_KEY"))
             else:
@@ -2731,13 +2755,19 @@ async def test_ai_connection(settings: AISettingsRequest, current_user: User = D
             else:
                 raise HTTPException(
                     status_code=400, 
-                    detail=f"Ollama returned status {response.status_code}: {response.text}"
+                    detail=f"Ollama returned status {response.status_code}. Check the model name and server logs."
                 )
         else:
             raise HTTPException(status_code=400, detail="Invalid AI provider")
             
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Connection test failed: {str(e)}")
+        logger.warning(f"AI connection test failed: {type(e).__name__}: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail="Connection test failed. Check the provider, model, endpoint, and credentials, then see server logs for details.",
+        )
 
 @app.get("/settings/ollama/models")
 async def get_ollama_models(endpoint: str = "http://localhost:11434", current_user: User = Depends(require_admin)):
@@ -2782,13 +2812,17 @@ async def get_ollama_models(endpoint: str = "http://localhost:11434", current_us
             "total_models": len(models)
         }
         
+    except HTTPException:
+        raise
     except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to connect to Ollama at {endpoint}: {e}")
         raise HTTPException(
-            status_code=400, 
-            detail=f"Failed to connect to Ollama: {str(e)}"
+            status_code=400,
+            detail="Failed to connect to Ollama. Make sure it is running and the endpoint is correct.",
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching models: {str(e)}")
+        logger.error(f"Error fetching Ollama models: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching models. Please try again.")
 
 @app.get("/settings/ollama/models/demo")
 async def get_demo_ollama_models():
@@ -2841,7 +2875,7 @@ async def get_openai_models(endpoint: Optional[str] = None, current_user: User =
         base_url = endpoint if endpoint else os.getenv("OPENAI_ENDPOINT")
 
         # Always read the API key from DB/env — never accept it in the URL (query string leaks to logs)
-        stored = db.query(Settings).filter(Settings.id == 1).first()
+        stored = db.query(Settings).filter(Settings.org_id == current_user.org_id).first()
         raw_key = stored.openai_api_key if stored else None
         api_key = decrypt_secret(raw_key) if raw_key and is_encrypted(raw_key) else (raw_key or os.getenv("OPENAI_API_KEY"))
         
@@ -2895,7 +2929,8 @@ async def get_openai_models(endpoint: Optional[str] = None, current_user: User =
                         logger.warning(f"Skipping invalid model at index {i}: {model}")
                     
         except AttributeError as e:
-            raise HTTPException(status_code=500, detail=f"Unexpected response format from models endpoint: {str(e)}")
+            logger.error(f"Unexpected response format from models endpoint: {e}")
+            raise HTTPException(status_code=500, detail="Unexpected response format from models endpoint")
         except Exception as e:
             logger.error(f"OpenAI client models.list() failed: {str(e)}")
             
@@ -2943,7 +2978,7 @@ async def get_openai_models(endpoint: Optional[str] = None, current_user: User =
             if "models" in str(e).lower() or "404" in str(e):
                 raise HTTPException(status_code=404, detail="Models endpoint not found - may not be OpenAI-compatible")
             else:
-                raise HTTPException(status_code=500, detail=f"Error querying models: {str(e)}")
+                raise HTTPException(status_code=500, detail="Error querying models. Please try again.")
         
         # Sort by name
         models.sort(key=lambda x: x['name'])
@@ -2963,7 +2998,8 @@ async def get_openai_models(endpoint: Optional[str] = None, current_user: User =
         elif 'connection' in error_msg or 'timeout' in error_msg:
             raise HTTPException(status_code=503, detail="Cannot connect to the endpoint")
         else:
-            raise HTTPException(status_code=500, detail=f"Failed to fetch models: {str(e)}")
+            logger.error(f"Failed to fetch models: {type(e).__name__}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to fetch models. Please try again.")
 
 def create_chat_completion_safe(client, model, messages, max_tokens=None, temperature=None, use_json_mode=False):
     """
@@ -3027,6 +3063,120 @@ class DocumentBatchAnalysisRequest(BaseModel):
     controls: List[dict]   # [{code, title, framework, description, evidence_types}]
     prompt: str
 
+@app.post("/ai/validate-evidence")
+async def validate_evidence(
+    file: UploadFile = File(...),
+    requirement_code: str = Form(...),
+    validation_prompt: Optional[str] = Form(None),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Validate an uploaded evidence file against a requirement using the org's
+    configured AI provider. Extracts text (OCR for images) and asks the model
+    for a structured PASS/PARTIAL/FAIL verdict. Never fabricates an outcome —
+    if the model is unavailable, returns a neutral 'manual review' result.
+    """
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB")
+
+    filename = file.filename or "evidence"
+
+    # Extract evidence text (handles PDF/DOCX/TXT and OCR for images)
+    from text_extraction import text_extractor
+    try:
+        pages = text_extractor.extract_text(content, filename, file.content_type or "")
+        evidence_text = "\n".join(p["text"] for p in pages if p.get("text")).strip()[:8000]
+    except Exception as e:
+        logger.warning(f"Evidence text extraction failed for {filename}: {e}")
+        evidence_text = ""
+
+    neutral_result = {
+        "outcome": "PARTIAL",
+        "confidence": None,
+        "rationale": "Automated AI validation was unavailable; this evidence needs manual review.",
+        "findings": ["Document uploaded successfully but could not be automatically assessed."],
+        "recommendations": ["Review this evidence manually against the requirement."],
+        "file_info": {"name": filename, "size": len(content), "uploaded_at": datetime.utcnow().isoformat()},
+    }
+
+    if not evidence_text:
+        # No readable content — be honest rather than guessing from filename/size
+        neutral_result["rationale"] = "No readable text could be extracted from this file; manual review required."
+        return neutral_result
+
+    prompt = f"""You are a strict compliance auditor. Determine whether the evidence below satisfies the requirement "{requirement_code}".
+{validation_prompt or ''}
+
+EVIDENCE (extracted text):
+{evidence_text}
+
+Respond ONLY with valid JSON in this exact shape:
+{{"outcome":"PASS|PARTIAL|FAIL","confidence":0.0-1.0,"rationale":"short explanation","findings":["..."],"recommendations":["..."]}}
+Be strict: only PASS when the evidence clearly and comprehensively satisfies the requirement."""
+
+    try:
+        from ai_scanner import get_ai_client
+        ai_client = get_ai_client(current_user.org_id)
+
+        if isinstance(ai_client, dict) and ai_client.get('type') == 'ollama':
+            import requests
+            resp = requests.post(
+                f"{ai_client['endpoint']}/api/generate",
+                json={
+                    "model": ai_client['model'],
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.1, "num_predict": 800,
+                                "num_ctx": int(os.getenv("OLLAMA_CONTEXT_SIZE", "32768"))},
+                },
+                timeout=90,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Evidence validation: Ollama returned {resp.status_code}")
+                return neutral_result
+            ai_text = resp.json().get('response', '')
+        else:
+            completion = create_chat_completion_safe(
+                client=ai_client,
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=[
+                    {"role": "system", "content": "You are a strict compliance auditor. Respond only with valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=600,
+                temperature=0.1,
+                use_json_mode=True,
+            )
+            ai_text = completion.choices[0].message.content
+
+        parsed = _extract_json_from_response(ai_text)
+        if not parsed or "outcome" not in parsed:
+            logger.warning(f"Evidence validation: could not parse AI response for {filename}")
+            return neutral_result
+
+        outcome = str(parsed.get("outcome", "PARTIAL")).upper()
+        if outcome not in ("PASS", "PARTIAL", "FAIL"):
+            outcome = "PARTIAL"
+        try:
+            confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.5))))
+        except (TypeError, ValueError):
+            confidence = 0.5
+
+        return {
+            "outcome": outcome,
+            "confidence": confidence,
+            "rationale": str(parsed.get("rationale", ""))[:1000],
+            "findings": [str(f) for f in parsed.get("findings", [])][:10],
+            "recommendations": [str(r) for r in parsed.get("recommendations", [])][:10],
+            "file_info": {"name": filename, "size": len(content), "uploaded_at": datetime.utcnow().isoformat()},
+        }
+
+    except Exception as e:
+        logger.error(f"Evidence validation failed for {filename}: {e}")
+        return neutral_result
+
+
 @app.post("/ai/analyze-text")
 async def analyze_text_with_ai(request: ControlAnalysisRequest, current_user: User = Depends(get_current_user)):
     """Analyze text using the configured AI provider."""
@@ -3034,7 +3184,7 @@ async def analyze_text_with_ai(request: ControlAnalysisRequest, current_user: Us
         from ai_scanner import get_ai_client
         import json as json_module
         
-        ai_client = get_ai_client()
+        ai_client = get_ai_client(current_user.org_id)
         
         if isinstance(ai_client, dict) and ai_client.get('type') == 'ollama':
             # Handle Ollama
@@ -3061,7 +3211,7 @@ async def analyze_text_with_ai(request: ControlAnalysisRequest, current_user: Us
             if response.status_code != 200:
                 raise HTTPException(
                     status_code=500, 
-                    detail=f"Ollama API error: {response.status_code} - {response.text}"
+                    detail=f"Ollama API error (status {response.status_code})."
                 )
             
             result = response.json()
@@ -3100,7 +3250,7 @@ async def analyze_text_with_ai(request: ControlAnalysisRequest, current_user: Us
         logger.error(f"AI analysis failed: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"AI analysis failed: {str(e)}"
+            detail="AI analysis failed. Please try again."
         )
 
 @app.post("/api/ai/analyze-image")
@@ -3139,7 +3289,7 @@ async def analyze_image_with_ai(
         except Exception:
             processed_content = image_content
 
-        ai_client = get_ai_client()
+        ai_client = get_ai_client(current_user.org_id)
 
         if not isinstance(ai_client, dict):  # OpenAI
             try:
@@ -3252,7 +3402,7 @@ async def analyze_image_with_ai(
         logger.error(f"Image analysis failed: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Image analysis failed: {str(e)}"
+            detail="Image analysis failed. Please try again."
         )
 
 @app.post("/analyze-documents")
@@ -3262,7 +3412,7 @@ async def analyze_multiple_documents(request: DocumentBatchAnalysisRequest, curr
         from ai_scanner import get_ai_client
         import json as json_module
         
-        ai_client = get_ai_client()
+        ai_client = get_ai_client(current_user.org_id)
         
         # Prepare the analysis prompt with all document information
         documents_summary = []
@@ -3335,7 +3485,8 @@ Do not include any text before or after the JSON. Do not use markdown formatting
                 if not result and 'thinking' in result_json:
                     result = result_json.get('thinking', '')
             else:
-                raise HTTPException(status_code=500, detail=f"Ollama API error: {response.text}")
+                logger.error(f"Ollama API error (status {response.status_code}): {response.text[:200]}")
+                raise HTTPException(status_code=500, detail=f"Ollama API error (status {response.status_code}).")
                 
         else:
             # Handle OpenAI
@@ -3371,11 +3522,13 @@ Do not include any text before or after the JSON. Do not use markdown formatting
             logger.warning(f"Error parsing batch analysis response: {e}")
             return {"suggestions": [], "raw_response": result}
             
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Batch document analysis failed: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail=f"Batch analysis failed: {str(e)}"
+            detail="Batch analysis failed. Please try again."
         )
 
 @app.post("/analyze-document-controls")
@@ -3425,7 +3578,7 @@ async def analyze_document_controls(
                 
                 # Use AI to describe the image content
                 from ai_scanner import get_ai_client
-                ai_client = get_ai_client()
+                ai_client = get_ai_client(current_user.org_id)
                 
                 if isinstance(ai_client, dict) and ai_client.get('type') == 'ollama':
                     # Ollama with vision models (if available)
@@ -3559,7 +3712,7 @@ Limit to the top 3 most relevant matches. If no relevant matches, return empty a
         # Call AI analysis
         from ai_scanner import get_ai_client
         
-        ai_client = get_ai_client()
+        ai_client = get_ai_client(current_user.org_id)
         
         if isinstance(ai_client, dict) and ai_client.get('type') == 'ollama':
             # Handle Ollama

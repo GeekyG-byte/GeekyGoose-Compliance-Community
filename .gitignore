@@ -104,3 +104,4 @@ htmlcov/
 # Cache
 .cache/
 .parcel-cache/
+CODE_REVIEW.md

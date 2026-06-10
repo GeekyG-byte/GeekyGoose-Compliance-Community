@@ -15,6 +15,32 @@ from crypto import decrypt_secret, is_encrypted
 logger = logging.getLogger(__name__)
 
 
+def get_or_create_settings(db, org_id):
+    """Return the Settings row for an org, creating it from env defaults if missing.
+
+    Settings are per-organisation (multi-tenant); callers must pass the org_id.
+    """
+    settings = db.query(Settings).filter(Settings.org_id == org_id).first()
+    if settings:
+        return settings
+
+    settings = Settings(
+        org_id=org_id,
+        ai_provider=os.getenv("AI_PROVIDER", "ollama"),
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        openai_endpoint=os.getenv("OPENAI_ENDPOINT"),
+        ollama_endpoint=os.getenv("OLLAMA_ENDPOINT", "http://host.docker.internal:11434"),
+        ollama_model=os.getenv("OLLAMA_MODEL", "qwen2.5:14b"),
+        ollama_context_size=int(os.getenv("OLLAMA_CONTEXT_SIZE", "131072")),
+    )
+    if os.getenv("OPENAI_API_KEY"):
+        settings.openai_api_key = os.getenv("OPENAI_API_KEY")
+    db.add(settings)
+    db.commit()
+    db.refresh(settings)
+    return settings
+
+
 def _resolve_api_key(raw_key: Optional[str]) -> Optional[str]:
     """Decrypt the stored API key if it was encrypted with Fernet."""
     if not raw_key:
@@ -53,17 +79,15 @@ def create_chat_completion_safe(client, model, messages, temperature=None):
 # Initialize OpenAI client lazily
 client = None
 
-def get_vision_clients_for_dual_validation():
-    """Get vision clients for dual validation.
+def get_vision_clients_for_dual_validation(org_id):
+    """Get vision clients for dual validation, scoped to an organisation.
 
     Dual vision validation requires BOTH OpenAI and Ollama to be properly configured.
     If only one provider is configured, returns empty dict to signal dual mode is unavailable.
     """
     db = SessionLocal()
     try:
-        settings = db.query(Settings).filter(Settings.id == 1).first()
-        if not settings:
-            raise ValueError("No settings found in database")
+        settings = get_or_create_settings(db, org_id)
 
         clients = {}
 
@@ -126,19 +150,17 @@ def get_vision_clients_for_dual_validation():
     finally:
         db.close()
 
-def get_ai_client():
-    """Get AI client based on configured provider from database."""
+def get_ai_client(org_id=None):
+    """Get AI client based on an organisation's configured provider.
+
+    org_id is required in normal multi-tenant operation. When None (system/test
+    context with no org), falls back to environment-variable configuration.
+    """
     db = SessionLocal()
     try:
-        # Get settings from database
-        settings = db.query(Settings).filter(Settings.id == 1).first()
-
-        # Fall back to environment variables if database settings don't exist
-        if not settings:
-            logger.warning("No settings found in database, using environment variables")
-            provider = os.getenv('AI_PROVIDER', 'ollama')
-        else:
-            provider = settings.ai_provider
+        # Get (or lazily create) this org's settings; None => env fallback
+        settings = get_or_create_settings(db, org_id) if org_id is not None else None
+        provider = settings.ai_provider if settings is not None else os.getenv('AI_PROVIDER', 'ollama')
 
         if provider == 'openai':
             # Get settings from database or fallback to environment
@@ -191,9 +213,9 @@ def get_ai_client():
     finally:
         db.close()
 
-def get_openai_client():
+def get_openai_client(org_id):
     """Legacy function for backward compatibility."""
-    return get_ai_client()
+    return get_ai_client(org_id)
 
 class Citation(BaseModel):
     """Citation reference to evidence in documents."""
@@ -236,31 +258,32 @@ class ComplianceScanner:
         self.model = model
         self.prompt_version = "v1.0"
     
-    def scan_control(self, control: Control, requirements: List[Requirement], 
-                    evidence_texts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def scan_control(self, control: Control, requirements: List[Requirement],
+                    evidence_texts: List[Dict[str, Any]], org_id=None) -> Dict[str, Any]:
         """
         Scan a compliance control against provided evidence.
-        
+
         Args:
             control: The control being evaluated
             requirements: List of requirements for the control
             evidence_texts: List of evidence text excerpts with metadata
-            
+            org_id: Organisation whose AI settings should be used
+
         Returns:
             Dictionary with requirements results and gaps
         """
         try:
             # Build the prompt
             prompt = self._build_scan_prompt(control, requirements, evidence_texts)
-            
+
             logger.info(f"Starting AI scan for control {control.code} with {len(requirements)} requirements")
-            
+
             # Call AI provider (OpenAI or Ollama)
-            ai_client = get_ai_client()
-            
+            ai_client = get_ai_client(org_id)
+
             if isinstance(ai_client, dict) and ai_client.get('type') == 'ollama':
                 # Handle Ollama
-                response = self._call_ollama(ai_client, prompt)
+                response = self._call_ollama(ai_client, prompt, org_id)
             else:
                 # Handle OpenAI - use standard chat completions with JSON
                 response = create_chat_completion_safe(
@@ -428,7 +451,7 @@ You must respond with valid JSON only, following this exact schema:
         
         return prompt
 
-    def _call_ollama(self, client_config: Dict, prompt: str) -> ScanResponse:
+    def _call_ollama(self, client_config: Dict, prompt: str, org_id=None) -> ScanResponse:
         """Call Ollama API and parse response."""
         import requests
         import json
@@ -436,13 +459,16 @@ You must respond with valid JSON only, following this exact schema:
         endpoint = client_config['endpoint']
         model = client_config['model']
 
-        # Get context size from database settings
-        db = SessionLocal()
-        try:
-            settings = db.query(Settings).filter(Settings.id == 1).first()
-            context_size = settings.ollama_context_size if settings else 131072
-        finally:
-            db.close()
+        # Get context size from this org's settings (env fallback when no org)
+        if org_id is not None:
+            db = SessionLocal()
+            try:
+                settings = get_or_create_settings(db, org_id)
+                context_size = settings.ollama_context_size or 131072
+            finally:
+                db.close()
+        else:
+            context_size = int(os.getenv("OLLAMA_CONTEXT_SIZE", "131072"))
         
         # Add JSON schema instruction to prompt
         json_prompt = prompt + """

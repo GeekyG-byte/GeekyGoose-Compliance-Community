@@ -160,9 +160,10 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Settings table (singleton pattern with id=1)
+-- Settings table (one row per organisation — multi-tenant)
 CREATE TABLE IF NOT EXISTS settings (
-    id INTEGER PRIMARY KEY DEFAULT 1,
+    id SERIAL PRIMARY KEY,
+    org_id UUID NOT NULL UNIQUE REFERENCES orgs(id) ON DELETE CASCADE,
     ai_provider VARCHAR(50) DEFAULT 'ollama',
     openai_api_key VARCHAR(500),
     openai_model VARCHAR(100) DEFAULT 'gpt-4o',
@@ -175,14 +176,11 @@ CREATE TABLE IF NOT EXISTS settings (
     min_confidence_threshold REAL DEFAULT 0.90,
     use_dual_vision_validation BOOLEAN DEFAULT false,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT single_settings_row CHECK (id = 1)
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Insert default settings if table is empty
-INSERT INTO settings (id, ai_provider, openai_model, openai_vision_model, ollama_endpoint, ollama_model, ollama_vision_model, ollama_context_size, min_confidence_threshold)
-VALUES (1, 'ollama', 'gpt-4o', 'gpt-4o', 'http://host.docker.internal:11434', 'qwen2.5:14b', 'qwen2-vl', 131072, 0.90)
-ON CONFLICT (id) DO NOTHING;
+-- Settings rows are created lazily per organisation by the application
+-- (get_or_create_settings); no global default row is seeded.
 
 -- Indexes for performance (only create if they don't exist)
 CREATE INDEX IF NOT EXISTS idx_users_org_id ON users(org_id);

@@ -29,6 +29,7 @@ celery_app.conf.update(
     task_routes={
         'worker_tasks.extract_document_text': {'queue': 'extraction'},
         'worker_tasks.process_scan': {'queue': 'ai_tasks'},  # AI-intensive scanning
+        'worker_tasks.process_document_ai_analysis': {'queue': 'ai_tasks'},  # AI-intensive analysis
         'worker_tasks.cleanup_old_scans': {'queue': 'celery'},  # Lightweight tasks
     },
 

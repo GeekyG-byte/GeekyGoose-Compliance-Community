@@ -64,29 +64,69 @@ def extract_document_text(self, document_id: str):
         db.close()
 
 @celery_app.task(bind=True)
+def process_document_ai_analysis(self, document_id: str, org_id: str):
+    """
+    Run AI control-suggestion analysis for an uploaded document and persist the
+    resulting document-control links. Offloaded from the API event loop so the
+    blocking AI/OCR/HTTP work never stalls request handling.
+    """
+    import asyncio
+
+    db = SessionLocal()
+    try:
+        document = db.query(Document).filter(Document.id == document_id).first()
+        if not document:
+            logger.warning(f"AI analysis task: document {document_id} not found")
+            return {"status": "skipped", "reason": "document not found"}
+        filename = document.filename
+        storage_key = document.storage_key
+    finally:
+        db.close()
+
+    try:
+        file_content = storage.download_file(storage_key)
+    except Exception as e:
+        logger.error(f"AI analysis task: failed to download {document_id}: {e}")
+        raise self.retry(exc=e, countdown=60, max_retries=3)
+
+    # The analysis routine lives in main.py; import lazily to avoid a circular
+    # import at module load (main imports this module at top level). Ensure the
+    # app directory is importable — the Celery worker process does not always
+    # have the cwd on sys.path at task runtime.
+    import sys, os
+    _app_dir = os.path.dirname(os.path.abspath(__file__))
+    if _app_dir not in sys.path:
+        sys.path.insert(0, _app_dir)
+    from main import process_document_ai_analysis_background
+
+    asyncio.run(
+        process_document_ai_analysis_background(document_id, filename, file_content, org_id)
+    )
+    return {"status": "success", "document_id": str(document_id)}
+
+
+@celery_app.task(bind=True)
 def process_scan(self, scan_id: str):
     """
     Process a compliance scan using AI.
     """
     db = SessionLocal()
+    scan = None
     try:
         # Get scan from database
         scan = db.query(Scan).filter(Scan.id == scan_id).first()
         if not scan:
             raise ValueError(f"Scan {scan_id} not found")
-        
+
         logger.info(f"Starting compliance scan {scan_id} for control {scan.control.code}")
 
-        # Get AI provider and model from settings
-        from models import Settings
-        settings = db.query(Settings).filter(Settings.id == 1).first()
-        if settings:
-            if settings.ai_provider == 'ollama':
-                model_name = f"{settings.ollama_model} (Ollama)"
-            elif settings.ai_provider == 'openai':
-                model_name = settings.openai_model or 'gpt-4o-mini'
-            else:
-                model_name = 'gpt-4'
+        # Get AI provider and model from this org's settings
+        from ai_scanner import get_or_create_settings
+        settings = get_or_create_settings(db, scan.org_id)
+        if settings.ai_provider == 'ollama':
+            model_name = f"{settings.ollama_model} (Ollama)"
+        elif settings.ai_provider == 'openai':
+            model_name = settings.openai_model or 'gpt-4o-mini'
         else:
             model_name = 'gpt-4'
 
@@ -111,10 +151,16 @@ def process_scan(self, scan_id: str):
             EvidenceLink.control_id == control.id
         ).all()
 
-        # AI-linked evidence
-        ai_evidence_links = db.query(DocumentControlLink).filter(
-            DocumentControlLink.control_id == control.id
-        ).all()
+        # AI-linked evidence, scoped to this scan's org to prevent cross-tenant bleed
+        ai_evidence_links = (
+            db.query(DocumentControlLink)
+            .join(Document, DocumentControlLink.document_id == Document.id)
+            .filter(
+                DocumentControlLink.control_id == control.id,
+                Document.org_id == scan.org_id,
+            )
+            .all()
+        )
 
         total_evidence = len(manual_evidence_links) + len(ai_evidence_links)
 
@@ -175,7 +221,8 @@ def process_scan(self, scan_id: str):
         scan_results = compliance_scanner.scan_control(
             control=control,
             requirements=requirements,
-            evidence_texts=evidence_texts
+            evidence_texts=evidence_texts,
+            org_id=scan.org_id,
         )
 
         # Update progress: AI analysis complete
@@ -242,9 +289,16 @@ def process_scan(self, scan_id: str):
     except Exception as e:
         logger.error(f"Error processing scan {scan_id}: {str(e)}")
         db.rollback()
-        scan.status = 'failed'
-        scan.current_step = f'Error: {str(e)[:100]}'
-        db.commit()
+        # Best-effort status update — never let the handler itself raise and mask
+        # the original error or skip the retry.
+        if scan is not None:
+            try:
+                scan.status = 'failed'
+                scan.current_step = f'Error: {str(e)[:100]}'
+                db.commit()
+            except Exception as status_err:
+                logger.error(f"Failed to mark scan {scan_id} as failed: {status_err}")
+                db.rollback()
         raise self.retry(exc=e, countdown=60, max_retries=3)
     finally:
         db.close()

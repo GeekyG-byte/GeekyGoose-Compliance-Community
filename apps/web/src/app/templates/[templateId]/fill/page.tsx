@@ -345,57 +345,21 @@ export default function FillTemplatePage() {
       
     } catch (error) {
       console.error('AI validation failed:', error);
-      
-      // Fallback to enhanced mock validation with more realistic results
-      const requirement = template?.evidence_requirements.find(req => req.requirement_code === requirementCode);
-      const validationPrompt = requirement?.ai_validation_prompt || '';
-      
-      // Provide more specific mock results based on requirement type
-      const isPolicy = requirement?.evidence_type === 'policy' || requirement?.evidence_type === 'document';
-      const isConfiguration = requirement?.evidence_type === 'configuration' || requirement?.evidence_type === 'screenshot';
-      
-      let mockFindings = ['Document uploaded successfully'];
-      let mockRecommendations = ['Review document content manually'];
-      let mockStatus: 'passed' | 'warning' | 'failed' = 'warning';
-      
-      if (isPolicy) {
-        mockFindings = [
-          'Policy document structure appears complete',
-          'Document contains procedural content',
-          'Format is suitable for compliance documentation'
-        ];
-        mockRecommendations = [
-          'Ensure policy covers all required control elements',
-          'Review approval and signature sections',
-          'Verify implementation procedures are detailed'
-        ];
-        mockStatus = Math.random() > 0.7 ? 'passed' : 'warning';
-      } else if (isConfiguration) {
-        mockFindings = [
-          'Configuration evidence provided',
-          'File format is appropriate for technical documentation',
-          'Evidence appears to be system-related'
-        ];
-        mockRecommendations = [
-          'Verify configuration settings align with security requirements',
-          'Ensure all relevant system components are covered',
-          'Consider adding explanatory annotations'
-        ];
-        mockStatus = Math.random() > 0.6 ? 'passed' : 'warning';
-      }
 
-      const mockResult: AIValidationResult = {
+      // Do NOT fabricate a compliance verdict. Surface an honest neutral result
+      // that makes clear the evidence still needs manual review.
+      const neutralResult: AIValidationResult = {
         requirement_code: requirementCode,
-        status: mockStatus,
-        confidence: Math.round((Math.random() * 0.3 + 0.5) * 100) / 100,
-        findings: mockFindings,
-        recommendations: mockRecommendations,
+        status: 'warning',
+        confidence: 0,
+        findings: ['Automated validation was unavailable for this evidence.'],
+        recommendations: ['Review this evidence manually against the requirement.'],
         validated_at: new Date().toISOString()
       };
 
       setAiValidationResults(prev => ({
         ...prev,
-        [requirementCode]: mockResult
+        [requirementCode]: neutralResult
       }));
     } finally {
       setValidatingEvidence(prev => {

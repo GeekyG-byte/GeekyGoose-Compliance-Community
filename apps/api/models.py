@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, DateTime, Integer, Text, BigInteger, ForeignKey, Float, Index
+from sqlalchemy import Column, String, DateTime, Integer, Text, BigInteger, ForeignKey, Float, Index, Boolean
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship, DeclarativeBase
 from datetime import datetime
@@ -254,7 +254,9 @@ class AuditLog(Base):
 class Settings(Base):
     __tablename__ = "settings"
 
-    id = Column(Integer, primary_key=True, default=1)  # Singleton pattern
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # One settings row per organisation (multi-tenant). Unique so each org has at most one.
+    org_id = Column(UUID(as_uuid=True), ForeignKey("orgs.id", ondelete="CASCADE"), unique=True, nullable=False)
     ai_provider = Column(String(50), default='ollama')
     openai_api_key = Column(String(500))
     openai_model = Column(String(100), default='gpt-4o')
@@ -265,6 +267,8 @@ class Settings(Base):
     ollama_vision_model = Column(String(100), default='qwen2-vl')
     ollama_context_size = Column(Integer, default=131072)
     min_confidence_threshold = Column(Float, default=0.90)
-    use_dual_vision_validation = Column(Integer, default=0)  # SQLite boolean (0/1)
+    use_dual_vision_validation = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    org = relationship("Org")
